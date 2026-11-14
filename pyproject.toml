@@ -1,0 +1,17 @@
+[project]
+name = "bist-intelligence"
+version = "0.1.0"
+description = "KAP financial statements and activity reports for BIST companies, published to PostgreSQL."
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+[tool.setuptools.packages.find]
+include = ["bist*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["notebooks"]

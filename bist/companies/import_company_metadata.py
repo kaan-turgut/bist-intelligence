@@ -1,0 +1,53 @@
+"""One-time import of the legacy company JSON files into PostgreSQL."""
+
+import json
+
+from bist.companies.metadata_store import (
+    _parse_timestamp,
+    connect_metadata_db,
+    upsert_company_metadata,
+    upsert_non_traded_metadata,
+)
+from bist.paths import DATA_MAPPINGS_DIR
+
+
+def import_company_metadata(
+    company_info_path=DATA_MAPPINGS_DIR / "company_info.json",
+    non_traded_path=DATA_MAPPINGS_DIR / "non_traded_company_codes.json",
+    *,
+    only_if_empty=False,
+):
+    with connect_metadata_db() as conn:
+        if only_if_empty:
+            conn.execute(
+                "LOCK TABLE metadata.companies, metadata.non_traded_company_codes "
+                "IN SHARE ROW EXCLUSIVE MODE"
+            )
+            has_metadata = conn.execute(
+                """SELECT EXISTS (SELECT 1 FROM metadata.companies)
+                       OR EXISTS (SELECT 1 FROM metadata.non_traded_company_codes)
+                       AS has_metadata"""
+            ).fetchone()["has_metadata"]
+            if has_metadata:
+                return 0, 0
+
+        with open(company_info_path, encoding="utf-8") as file:
+            companies = json.load(file)
+        with open(non_traded_path, encoding="utf-8") as file:
+            non_traded = json.load(file)
+
+        for symbol, info in companies.items():
+            scraped_at = _parse_timestamp(info.get("lastUpdated"))
+            upsert_company_metadata(conn, symbol, info, scraped_at=scraped_at)
+        for symbol, record in non_traded.items():
+            upsert_non_traded_metadata(conn, symbol, record)
+
+    return len(companies), len(non_traded)
+
+
+if __name__ == "__main__":
+    company_count, non_traded_count = import_company_metadata()
+    print(
+        f"Imported {company_count} companies and {non_traded_count} non-traded codes "
+        "into bist_finance."
+    )

@@ -1,0 +1,12 @@
+-r requirements.txt
+
+# Tests and linting
+pytest>=8,<10
+ruff>=0.5
+
+# notebooks/financial_statement_validation.ipynb
+ipython
+jupyter
+matplotlib
+nbformat
+plotly

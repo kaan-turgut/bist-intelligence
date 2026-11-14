@@ -1,0 +1,46 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# IDE settings
+.vscode/
+.idea/
+
+# Testing and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Bulk downloads (keep the folders, ignore their contents)
+financial_statements/*
+!financial_statements/.gitkeep
+activity_reports/*
+!activity_reports/.gitkeep
+
+# Archives and backups
+*.zip
+database_backups/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.part
