@@ -2,7 +2,7 @@
 
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import psycopg
@@ -44,7 +44,7 @@ def _parse_date(value):
     text = str(value).strip()
     for date_format in ("%d.%m.%Y", "%d/%m/%Y", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.strptime(text, date_format).replace(tzinfo=timezone.utc).date()
+            return datetime.strptime(text, date_format).replace(tzinfo=UTC).date()
         except ValueError:
             pass
     try:
@@ -60,12 +60,12 @@ def _parse_timestamp(value):
         return value
     text = str(value).strip()
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+        parsed = datetime.fromisoformat(text)
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
     except ValueError:
         for date_format in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
             try:
-                return datetime.strptime(text, date_format).replace(tzinfo=timezone.utc)
+                return datetime.strptime(text, date_format).replace(tzinfo=UTC)
             except ValueError:
                 pass
     raise ValueError(f"Unrecognized KAP timestamp value: {value!r}")
@@ -84,7 +84,7 @@ def _parse_local_timestamp(value):
             pass
     for date_format in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
         try:
-            return datetime.strptime(text, date_format)  # noqa: DTZ007
+            return datetime.strptime(text, date_format)
         except ValueError:
             pass
     raise ValueError(f"Unrecognized KAP trade registration date: {value!r}")
@@ -277,7 +277,7 @@ def upsert_company_metadata(conn, symbol, info, *, scraped_at=None):
         "kap_summary_url": info.get("kapSummaryUrl"),
         "kap_general_url": info.get("kapGeneralUrl"),
         "source": info.get("source", "KAP"),
-        "last_scraped_at": scraped_at or datetime.now(timezone.utc),
+        "last_scraped_at": scraped_at or datetime.now(UTC),
     }
     columns = list(values)
     assignments = ", ".join(
@@ -381,7 +381,7 @@ def upsert_non_traded_metadata(conn, symbol, record):
             symbol,
             summary_url,
             general_url,
-            _parse_timestamp(record.get("lastChecked")) or datetime.now(timezone.utc),
+            _parse_timestamp(record.get("lastChecked")) or datetime.now(UTC),
         ),
     )
 

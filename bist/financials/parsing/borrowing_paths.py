@@ -19,7 +19,7 @@ PARENTS = {
     for root in ROOTS
     for party in ("iliskili taraflardan", "iliskili olmayan taraflardan")
 }
-BORROWING_PATH_ITEMS = tuple([*ROOTS, *ROOTS.values(), *PARENTS])
+BORROWING_PATH_ITEMS = (*ROOTS, *ROOTS.values(), *PARENTS)
 
 
 def borrowing_path_overrides(source_rows):

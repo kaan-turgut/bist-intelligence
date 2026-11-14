@@ -312,12 +312,12 @@ def test_spawned_extraction_returns_rejected_sources_without_database_access(tmp
     with zipfile.ZipFile(archive, "w") as zipped:
         zipped.writestr(member, html_report(["1", "2", "3", "4"]))
     filings = [
-        dict(
-            source_path=f"{archive}/{member}",
-            fiscal_year=2026,
-            fiscal_quarter=2,
-            period_end=date(2026, 6, 30),
-        )
+        {
+            "source_path": f"{archive}/{member}",
+            "fiscal_year": 2026,
+            "fiscal_quarter": 2,
+            "period_end": date(2026, 6, 30),
+        }
         for _ in range(6)
     ]
     results = list(_prepared_eps_filings(filings, 2))
@@ -360,7 +360,7 @@ def test_legacy_typed_classification_is_corrected_from_same_source_cell():
             fetchall=lambda: [{**vars(old), "source_id": 77}]
         )
     )
-    filing = dict(company_id=1, fiscal_year=2026, fiscal_quarter=2, filing_key=1)
+    filing = {"company_id": 1, "fiscal_year": 2026, "fiscal_quarter": 2, "filing_key": 1}
     payload = {}
     observations = preserve_verified_eps(conn, filing, [current], payload)
     assert observations == [current]
@@ -402,7 +402,7 @@ def test_independent_reported_total_eps_is_preserved_when_continuing_eps_is_adde
     )
     observations = preserve_verified_eps(
         conn,
-        dict(company_id=1, fiscal_year=2026, fiscal_quarter=2, filing_key=1),
+        {"company_id": 1, "fiscal_year": 2026, "fiscal_quarter": 2, "filing_key": 1},
         [current],
         {},
     )
@@ -443,9 +443,9 @@ def test_conflict_quarantine_preserves_history_and_manual_sources(
         run_id=run,
         filing_key=filing,
     )
-    row = dict(
-        company_id=company, fiscal_year=2024, fiscal_quarter=1, filing_key=filing
-    )
+    row = {
+        "company_id": company, "fiscal_year": 2024, "fiscal_quarter": 1, "filing_key": filing
+    }
     assert (
         quarantine_conflicting_eps_source(conn, row, run, ValueError("Unknown units"))
         is False

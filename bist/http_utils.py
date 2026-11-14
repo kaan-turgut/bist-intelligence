@@ -1,4 +1,4 @@
-"""HTTP retry logic shared by the KAP and OpenAI clients."""
+"""HTTP retry logic shared by the KAP, İş Yatırım and OpenAI clients."""
 
 import logging
 import threading

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from bist.http_utils import send_with_retry
 from bist.paths import FINANCIAL_STATEMENTS_DIR
 
 logger = logging.getLogger(__name__)
@@ -20,45 +21,33 @@ def download_file(company, year, retries=5, delay=5, request_sleep=20.0, rate_li
     company_folder.mkdir(parents=True, exist_ok=True)
     filename = company_folder / f"{symbol}_{year}.zip"
 
-    attempt = 0
-    while attempt < retries:
-        try:
-            response = requests.get(url, stream=True, timeout=20)
-            if request_sleep:
-                time.sleep(request_sleep)
+    def send():
+        response = requests.get(url, stream=True, timeout=20)
+        if request_sleep:
+            time.sleep(request_sleep)
+        return response
 
-            if response.status_code == 429 and attempt < retries - 1:
-                attempt += 1
-                wait_seconds = rate_limit_delay * attempt
-                logger.warning(
-                    "KAP rate-limited %s %s; retrying in %.1fs (%s/%s)",
-                    symbol,
-                    year,
-                    wait_seconds,
-                    attempt,
-                    retries,
-                )
-                time.sleep(wait_seconds)
-                continue
+    try:
+        response = send_with_retry(
+            send,
+            retries=retries,
+            retry_backoff=delay,
+            rate_limit_backoff=rate_limit_delay,
+            label=f"{symbol} {year}",
+        )
+    except requests.RequestException as e:
+        logger.error("Failed to download %s %s after %s attempts: %s", symbol, year, retries, e)
+        return
 
-            response.raise_for_status()
-            if len(response.content) < 200:
-                logger.info("%s does not have a file for %s", symbol, year)
-                return
-            # Replace an existing archive only after the new one is fully written.
-            partial = filename.with_name(filename.name + ".part")
-            with open(partial, "wb") as f:
-                f.write(response.content)
-            partial.replace(filename)
-            logger.info("Downloaded %s", filename)
-            return  # success, stop retrying
-        except requests.exceptions.RequestException as e:
-            attempt += 1
-            if attempt < retries:
-                logger.warning("Retry %s/%s for %s %s after error: %s", attempt, retries, symbol, year, e)
-                time.sleep(delay)
-            else:
-                logger.error("Failed to download %s %s after %s attempts: %s", symbol, year, retries, e)
+    if len(response.content) < 200:
+        logger.info("%s does not have a file for %s", symbol, year)
+        return
+    # Replace an existing archive only after the new one is fully written.
+    partial = filename.with_name(filename.name + ".part")
+    with open(partial, "wb") as f:
+        f.write(response.content)
+    partial.replace(filename)
+    logger.info("Downloaded %s", filename)
 
 
 def download(begin_year, end_year, companies, max_workers=1, request_sleep=20.0, rate_limit_delay=300):

@@ -18,6 +18,7 @@ from bist.companies.metadata_store import (
     upsert_company_metadata,
     upsert_non_traded_metadata,
 )
+from bist.http_utils import send_with_retry
 from bist.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -84,55 +85,25 @@ def fetch_html(session, url, retries=6, retry_backoff=5.0, rate_limit_backoff=30
         "Referer": KAP_BASE_URL,
     }
 
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            response = session.get(url, timeout=30, headers=headers)
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < retries:
-                retry_after = response.headers.get("Retry-After")
-                backoff = rate_limit_backoff if response.status_code == 429 else retry_backoff
-                delay = float(retry_after) if retry_after and retry_after.isdecimal() else backoff * attempt
-                logger.warning(
-                    "KAP returned HTTP %s for %s; retrying in %.1fs (%s/%s)",
-                    response.status_code,
-                    url,
-                    delay,
-                    attempt,
-                    retries,
-                )
-                sleep(delay)
-                continue
-
-            try:
-                response.raise_for_status()
-            except requests.HTTPError:
-                body_preview = response.text[:300].replace("\n", " ").strip()
-                logger.error(
-                    "KAP request failed: HTTP %s for %s; response preview: %s",
-                    response.status_code,
-                    url,
-                    body_preview,
-                )
-                raise
-
-            return response.text
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt >= retries:
-                break
-
-            delay = retry_backoff * attempt
-            logger.warning(
-                "KAP request error for %s: %s; retrying in %.1fs (%s/%s)",
+    try:
+        response = send_with_retry(
+            lambda: session.get(url, timeout=30, headers=headers),
+            retries=retries,
+            retry_backoff=retry_backoff,
+            rate_limit_backoff=rate_limit_backoff,
+            label=url,
+        )
+    except requests.HTTPError as exc:
+        if exc.response is not None:
+            body_preview = exc.response.text[:300].replace("\n", " ").strip()
+            logger.error(
+                "KAP request failed: HTTP %s for %s; response preview: %s",
+                exc.response.status_code,
                 url,
-                exc,
-                delay,
-                attempt,
-                retries,
+                body_preview,
             )
-            sleep(delay)
-
-    raise last_error
+        raise
+    return response.text
 
 
 def discover_bist_company_urls(session, retries=6, retry_backoff=5.0, rate_limit_backoff=300.0):

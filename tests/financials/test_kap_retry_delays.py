@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
+from bist import http_utils
 from bist.companies import update_company_info as metadata
 from bist.financials.cli import build_parser
 from bist.financials.services import download_statements as statements
@@ -24,7 +25,7 @@ def test_statement_download_backs_off_from_300_seconds(monkeypatch, tmp_path):
     monkeypatch.setattr(
         statements.requests, "get", lambda *args, **kwargs: next(replies)
     )
-    monkeypatch.setattr(statements.time, "sleep", waits.append)
+    monkeypatch.setattr(http_utils.time, "sleep", waits.append)
     # No response is written: the small success body represents an empty year.
     monkeypatch.setattr(statements, "FINANCIAL_STATEMENTS_DIR", tmp_path)
     statements.download_file(
@@ -37,7 +38,7 @@ def test_metadata_429_default_changes_without_changing_other_http_backoff(monkey
     replies = iter([response(429), response(503), response(200)])
     session = SimpleNamespace(get=lambda *args, **kwargs: next(replies))
     waits = []
-    monkeypatch.setattr(metadata, "sleep", waits.append)
+    monkeypatch.setattr(http_utils.time, "sleep", waits.append)
     assert metadata.fetch_html(session, "https://www.kap.org.tr/test") == "no reports"
     assert waits == [300, 10]
 
@@ -45,7 +46,7 @@ def test_metadata_429_default_changes_without_changing_other_http_backoff(monkey
 def test_metadata_keeps_honoring_retry_after(monkeypatch):
     replies = iter([response(429, headers={"Retry-After": "900"}), response(200)])
     waits = []
-    monkeypatch.setattr(metadata, "sleep", waits.append)
+    monkeypatch.setattr(http_utils.time, "sleep", waits.append)
     metadata.fetch_html(
         SimpleNamespace(get=lambda *args, **kwargs: next(replies)),
         "https://www.kap.org.tr/test",
@@ -89,7 +90,7 @@ def test_kap_cli_defaults_and_price_defaults_remain_independent(monkeypatch):
     last._content = b'{"ok":true,"value":[]}'
     replies = iter([response(429), last])
     waits = []
-    monkeypatch.setattr(prices.time, "sleep", waits.append)
+    monkeypatch.setattr(http_utils.time, "sleep", waits.append)
     prices.fetch_symbol_prices(
         "TEST",
         "2026-01-01",

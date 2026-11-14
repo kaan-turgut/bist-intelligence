@@ -1,11 +1,12 @@
 """Fetch and normalize historical BIST prices from Is Yatirim."""
 
 import logging
-import time
 from datetime import date, datetime
 
 import pandas as pd
 import requests
+
+from bist.http_utils import send_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ PRICE_COLUMNS = {
     "DOLAR_BAZLI_MAX": "high_price_usd",
     "DOLAR_BAZLI_AOF": "weighted_average_price_usd",
 }
+
+
 def parse_price_date(value):
     if isinstance(value, datetime):
         return value.date()
@@ -85,35 +88,17 @@ def fetch_symbol_prices(
         "X-Requested-With": "XMLHttpRequest",
     }
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = session.get(
-                ISYATIRIM_PRICE_URL, params=params, headers=headers, timeout=timeout
-            )
-            if response.status_code == 429:
-                if attempt == max_attempts:
-                    response.raise_for_status()
-                logger.warning(
-                    "Is Yatirim rate-limited %s; waiting %.0f seconds (%s/%s)",
-                    symbol, rate_limit_delay, attempt, max_attempts,
-                )
-                time.sleep(rate_limit_delay)
-                continue
-            response.raise_for_status()
-            payload = response.json()
-            if not payload.get("ok", False):
-                raise ValueError(f"Is Yatirim returned an error for {symbol}: {payload}")
-            return payload.get("value", [])
-        except (requests.Timeout, requests.ConnectionError):
-            if attempt == max_attempts:
-                raise
-            delay = min(10 * attempt, 60)
-            logger.warning(
-                "Temporary connection error for %s; retrying in %s seconds (%s/%s)",
-                symbol, delay, attempt, max_attempts,
-            )
-            time.sleep(delay)
-    return []
+    response = send_with_retry(
+        lambda: session.get(ISYATIRIM_PRICE_URL, params=params, headers=headers, timeout=timeout),
+        retries=max_attempts,
+        retry_backoff=10,
+        rate_limit_backoff=rate_limit_delay,
+        label=f"Is Yatirim {symbol}",
+    )
+    payload = response.json()
+    if not payload.get("ok", False):
+        raise ValueError(f"Is Yatirim returned an error for {symbol}: {payload}")
+    return payload.get("value", [])
 
 
 def prices_to_frame(rows):

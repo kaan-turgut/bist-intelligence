@@ -342,7 +342,7 @@ def test_eps_only_refresh_keeps_financial_rows_and_snapshots_previous_values(dat
 def test_failed_eps_only_refresh_rolls_back_derived_values_and_snapshots(
     database, monkeypatch
 ):
-    conn, company, run = published_eps_refresh_example(database)
+    conn, _company, _run = published_eps_refresh_example(database)
     from bist.financials.services import price_earnings as pe_service
 
     def fail(*args, **kwargs):
@@ -489,7 +489,7 @@ def test_legacy_neighbor_currency_is_corrected_only_with_same_cell_and_explicit_
     payload = {}
     result = preserve_verified_eps(
         conn,
-        dict(company_id=1, fiscal_year=2026, fiscal_quarter=2, filing_key=1),
+        {"company_id": 1, "fiscal_year": 2026, "fiscal_quarter": 2, "filing_key": 1},
         [current],
         payload,
     )

@@ -20,12 +20,12 @@ from bist.financials.services.price_earnings import (
 
 def example():
     end = date(2024, 3, 31)
-    row = dict(value_ttm=Decimal(2),period_end=end,period_end_count=1,
-        price_date=date(2024,3,29),instrument_id=1,instrument_count=1,currency="TRY",
-        source_payload={"at_the_date_close_price": "20", "close_price": "5"},
-        calculation_details={"unit":"TRY_per_1_TRY_nominal","source_ids":[1],"ttm_method":"annual_report"})
-    source = dict(source_id=1,period_end=end,purchasing_power_date=end,
-                  normalization={"split_adjustment_factor":"1"})
+    row = {"value_ttm": Decimal(2),"period_end": end,"period_end_count": 1,
+        "price_date": date(2024,3,29),"instrument_id": 1,"instrument_count": 1,"currency": "TRY",
+        "source_payload": {"at_the_date_close_price": "20", "close_price": "5"},
+        "calculation_details": {"unit":"TRY_per_1_TRY_nominal","source_ids":[1],"ttm_method":"annual_report"}}
+    source = {"source_id": 1,"period_end": end,"purchasing_power_date": end,
+                  "normalization": {"split_adjustment_factor":"1"}}
     return row, [source]
 
 
@@ -106,7 +106,7 @@ def published_period(database):
 
 
 def test_database_refresh_uses_fiscal_end_and_publishes_auditable_ratio(published_period):
-    conn,company,run = published_period
+    conn,_company,run = published_period
     result = calculate_price_earnings_postgres()
     assert result["available"] == 1
     row = conn.execute("SELECT * FROM gold.current_price_earnings").fetchone()
@@ -128,7 +128,7 @@ def test_database_refresh_uses_fiscal_end_and_publishes_auditable_ratio(publishe
 
 def test_valuation_failure_rolls_back_publication(published_period,monkeypatch):
     from bist.financials.services import price_earnings as service
-    conn,company,run = published_period
+    conn,_company,_run = published_period
     calculate_price_earnings_postgres()
     before = conn.execute("SELECT * FROM gold.current_price_earnings").fetchone()
     conn.commit()
@@ -145,7 +145,7 @@ def test_valuation_failure_rolls_back_publication(published_period,monkeypatch):
 
 
 def test_new_financial_version_hides_old_valuation(published_period):
-    conn,company,run = published_period
+    conn,company,_run = published_period
     calculate_price_earnings_postgres()
     newer = financials._run_start(conn,"test",{})
     conn.execute("UPDATE ops.active_company_versions SET run_id=%s WHERE company_id=%s",(newer,company))
@@ -153,7 +153,7 @@ def test_new_financial_version_hides_old_valuation(published_period):
 
 
 def test_automatic_gold_valuation_can_be_repeated_within_same_run(published_period):
-    conn,company,run = published_period
+    conn,_company,run = published_period
     for _ in range(2):
         assert calculate_price_earnings(conn,run,financial_run_id=run)["available"] == 1
     assert conn.execute("SELECT COUNT(*) AS n FROM gold.price_earnings_values").fetchone()["n"] == 1

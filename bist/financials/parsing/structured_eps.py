@@ -145,22 +145,22 @@ def structured_eps_cells(data, fiscal_quarter, expected_end=None):
                     )
                     continue
                 cells.append(
-                    dict(
-                        period_start=period[0],
-                        period_end=period[1],
-                        period_kind=period_kind,
-                        eps_kind=kind,
-                        share_class=share_class,
-                        earnings_scope=scope,
-                        raw_value=amount,
-                        label=label,
-                        parent_label=parent_label if typed else None,
-                        source_row_id=source_id or parent_id,
-                        typed_dimension=typed,
-                        source_column_index=index + 1,
-                        column_header=text(headers[index]),
-                        all_column_values=[text(v) for v in values],
-                    )
+                    {
+                        "period_start": period[0],
+                        "period_end": period[1],
+                        "period_kind": period_kind,
+                        "eps_kind": kind,
+                        "share_class": share_class,
+                        "earnings_scope": scope,
+                        "raw_value": amount,
+                        "label": label,
+                        "parent_label": parent_label if typed else None,
+                        "source_row_id": source_id or parent_id,
+                        "typed_dimension": typed,
+                        "source_column_index": index + 1,
+                        "column_header": text(headers[index]),
+                        "all_column_values": [text(v) for v in values],
+                    }
                 )
     return cells, warnings
 

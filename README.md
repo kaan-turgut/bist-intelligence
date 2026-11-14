@@ -86,6 +86,7 @@ database/migrations/  SQL migrations for the shared bist_finance database
 data_mappings/        KAP statement mappings and seed company metadata
 docs/                 Pipeline guides and the activity report database guide (PDF)
 notebooks/            Financial statement validation notebook
+reports/              Published analysis reports (PDF)
 tests/
   financials/         Financial pipeline tests
   activity_reports/   Activity report pipeline tests

@@ -1,6 +1,7 @@
 """Assess every published period and expose capital estimates separately."""
 
 import hashlib
+import itertools
 from collections import defaultdict
 from datetime import timedelta
 
@@ -260,7 +261,7 @@ def calculate_eps_coverage(conn, run_id, capital=None, cpi=None, company_ids=Non
                         start = window[0]["period_start"]
                         if (end - start).days in (364, 365) and all(
                             b["period_start"] == a["period_end"] + timedelta(days=1)
-                            for a, b in zip(window, window[1:])
+                            for a, b in itertools.pairwise(window)
                         ):
                             if all(r["measurement_basis"] == "nominal" for r in window):
                                 amount = sum(r["value_quarter"] for r in window)

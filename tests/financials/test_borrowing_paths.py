@@ -44,14 +44,14 @@ def test_new_parser_keeps_counterparty_parent_for_other_borrowings(tmp_path, roo
 def bronze_rows():
     root = "short-term liabilities > short-term borrowings"
     return [
-        dict(filing_key=1, source_row_id="210000:130", item="ilişkili taraflardan kısa vadeli borçlanmalar",
-             line_item_path=root + " > related-party short-term borrowings"),
-        dict(filing_key=1, source_row_id="210000:134", item="diğer kısa vadeli borçlanmalar",
-             line_item_path=root + " > other short-term borrowings"),
-        dict(filing_key=1, source_row_id="210000:135", item="ilişkili olmayan taraflardan kısa vadeli borçlanmalar",
-             line_item_path=root + " > unrelated-party short-term borrowings"),
-        dict(filing_key=1, source_row_id="210000:139", item="diğer kısa vadeli borçlanmalar",
-             line_item_path=root + " > other short-term borrowings"),
+        {"filing_key": 1, "source_row_id": "210000:130", "item": "ilişkili taraflardan kısa vadeli borçlanmalar",
+             "line_item_path": root + " > related-party short-term borrowings"},
+        {"filing_key": 1, "source_row_id": "210000:134", "item": "diğer kısa vadeli borçlanmalar",
+             "line_item_path": root + " > other short-term borrowings"},
+        {"filing_key": 1, "source_row_id": "210000:135", "item": "ilişkili olmayan taraflardan kısa vadeli borçlanmalar",
+             "line_item_path": root + " > unrelated-party short-term borrowings"},
+        {"filing_key": 1, "source_row_id": "210000:139", "item": "diğer kısa vadeli borçlanmalar",
+             "line_item_path": root + " > other short-term borrowings"},
     ]
 
 
