@@ -59,7 +59,7 @@ def extract_filing_eps(
     ]
     references, pdf_sources = [], []
     digest = hashlib.sha256(
-        b"structured_eps_v7\0" + (b"ocr\0" if ocr else b"") + statement
+        b"structured_eps_v8\0" + (b"ocr\0" if ocr else b"") + statement
     )
     for member in turkish or members:
         data = zipped.read(member)
@@ -145,6 +145,47 @@ def preserve_verified_eps(conn, filing, observations, payload):
     retained = []
     for previous in old:
         corrected = False
+        # The same raw EPS cell re-read with a corrected per-share nominal value
+        # (aggregate amounts were once taken as share nominal values) replaces
+        # the legacy normalization instead of being reported as a conflict.
+        for current in observations:
+            if (
+                previous.normalization.get("raw_reported_eps") is not None
+                and Decimal(previous.normalization["raw_reported_eps"])
+                == Decimal(current.normalization.get("raw_reported_eps") or "NaN")
+                and Decimal(previous.normalization.get("share_nominal_value", "1"))
+                != Decimal(current.normalization.get("share_nominal_value", "1"))
+                and previous.normalization.get("eps_unit")
+                == current.normalization.get("eps_unit")
+                and (
+                    previous.period_start,
+                    previous.period_end,
+                    previous.period_kind,
+                    previous.eps_kind,
+                    previous.earnings_scope,
+                    previous.share_class,
+                )
+                == (
+                    current.period_start,
+                    current.period_end,
+                    current.period_kind,
+                    current.eps_kind,
+                    current.earnings_scope,
+                    current.share_class,
+                )
+            ):
+                payload.setdefault("corrected_legacy_nominal_values", []).append(
+                    {
+                        "source_id": previous.source_id,
+                        "period_kind": previous.period_kind,
+                        "from": previous.normalization.get("share_nominal_value"),
+                        "to": current.normalization.get("share_nominal_value"),
+                    }
+                )
+                corrected = True
+                break
+        if corrected:
+            continue
         if previous.normalization.get("validation") == "explicit_nominal_pdf_layout":
             from bist.financials.parsing.eps import _eps_unit
             from bist.financials.parsing.eps_recovery import per_nominal_unit
@@ -315,10 +356,20 @@ def _extract_local_filing(filing):
 
 
 def quarantine_conflicting_eps_source(conn, filing, run_id, error):
-    """Deactivate only contradicted automatic sources; preserve their history."""
+    """Deactivate contradicted automatic sources; preserve their history.
+
+    A source whose per-share nominal value the current extractor can no longer
+    establish (aggregate amounts, contradictory declarations) is also retired:
+    its normalized EPS depended on that value.
+    """
     if not any(
         word in str(error)
-        for word in ("disagree", "reconciliation", "does not reconcile")
+        for word in (
+            "disagree",
+            "reconciliation",
+            "does not reconcile",
+            "unambiguous nominal share value",
+        )
     ):
         return False
     previous = conn.execute(

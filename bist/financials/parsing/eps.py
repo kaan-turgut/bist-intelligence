@@ -50,7 +50,15 @@ NOTE = re.compile(
 )
 
 
-def parse_number(text):
+AMBIGUOUS_THOUSANDS = re.compile(r"\(?\s*-?\d{1,3}\.\d{3}\s*\)?")
+
+
+def is_ambiguous_thousands(token):
+    """"25.870" is 25870 in Turkish layout but 25.87 in dot-decimal layout."""
+    return bool(AMBIGUOUS_THOUSANDS.fullmatch(token.strip()))
+
+
+def parse_number(text, *, dot_decimal=False):
     original = text
     text = text.strip()
     if text in {"-", "–", "—"}:
@@ -66,7 +74,9 @@ def parse_number(text):
         raise ValueError(f"Invalid EPS number: {original!r}")
     if "," in text:
         text = text.replace(".", "").replace(",", ".")
-    elif re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", text):
+    elif re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", text) and not (
+        dot_decimal and text.count(".") == 1
+    ):
         text = text.replace(".", "")
     result = Decimal(text)
     return -abs(result) if negative else result
@@ -178,26 +188,68 @@ def _ocr_empty_pages(data, pages):
     return pages
 
 
+NOMINAL_AMOUNT = r"(\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+(?:[,.]\d+)?)"
+PER_SHARE_CUE = re.compile(
+    r"(?:\bher\s+biri|\bbeher(?:i)?|\bbirim|\btanesi|(?:pay|hisse)\s+basina"
+    r"|\bbir\s+(?:pay|hisse)[a-z]*)\b[^\d.,;:]{0,12}$"
+)
+
+
+def _nominal_amount(amount, unit):
+    """Read Turkish separators; return None for an undecidable "1.000".
+
+    Reports use one dotted group both ways: KBORU's "bir hissesinin nominal
+    değeri 1.000 TL" is 1 TL, while "her biri 1.000 TL ... 50 adet ... 50.000
+    TL" is 1,000 TL. Several groups ("5.336.900.000") are always thousands.
+    """
+    if re.fullmatch(r"\d{1,3}\.\d{3}", amount):
+        return None
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+(?:,\d+)?", amount):
+        amount = amount.replace(".", "")
+    value = Decimal(amount.replace(",", "."))
+    return value if unit == "tl" else value / 100
+
+
 def _nominal_values(text):
     normalized = unidecode(text).lower()
     values = set()
-    pattern = r"(?<![\d.,])(\d+(?:[,.]\d+)?)\s*(?:tam\s+)?(tl|kr\.?|krs\.?|kurus)\s*(?:nominal|itibari)\s*(?:deger|bedel)"
-    for amount, unit in re.findall(pattern, normalized):
-        value = Decimal(amount.replace(",", "."))
-        values.add(value if unit == "tl" else value / 100)
+    # "X TL nominal değerli ..." also describes aggregate holdings, buybacks,
+    # offerings and share classes ("toplam 214.000 TL nominal değerli pay").
+    # Accept it as a per-share value only with an explicit per-share cue, or
+    # when the amount cannot plausibly be an aggregate (at most 1 TL).
     pattern = (
-        r"nominal\s*(?:pay\s+)?degeri\s*(\d+(?:[,.]\d+)?)\s*(?:tam\s+)?(tl|kr\.?|kurus)"
+        r"(?<![\d.,])" + NOMINAL_AMOUNT + r"\s*(?:tam\s+)?(tl|kr\.?|krs\.?|kurus)"
+        r"\s*(?:nominal|itibari)\s*(?:deger|bedel)"
     )
-    for amount, unit in re.findall(pattern, normalized):
-        value = Decimal(amount.replace(",", "."))
-        values.add(value if unit == "tl" else value / 100)
+    for match in re.finditer(pattern, normalized):
+        value = _nominal_amount(match[1], match[2].rstrip("."))
+        if value is not None and (
+            value <= 1 or PER_SHARE_CUE.search(normalized[: match.start()])
+        ):
+            values.add(value)
+    pattern = (
+        r"nominal\s*(?:pay\s+)?degeri\s*"
+        + NOMINAL_AMOUNT
+        + r"\s*(?:tam\s+)?(tl|kr\.?|kurus)"
+    )
+    # "... nominal değeri 53.369.000 TL'dir" is also used for total capital.
+    for match in re.finditer(pattern, normalized):
+        value = _nominal_amount(match[1], match[2].rstrip("."))
+        if value is not None and (
+            value <= 1 or PER_SHARE_CUE.search(normalized[: match.start()])
+        ):
+            values.add(value)
     # Explicit "each share" declarations are also found without the words
-    # nominal/itibari (for example "her biri 1 krş").
+    # nominal/itibari (for example "her biri 1 krş", "beheri 1 kuruş olan").
     for amount, unit in re.findall(
-        r"her\s+biri\s+(\d+(?:[,.]\d+)?)\s*(tl|krs\.?|kurus|kr\.?)\b", normalized
+        r"(?:her\s+biri|\bbeher(?:i)?)\s+"
+        + NOMINAL_AMOUNT
+        + r"\s*(?:tam\s+)?(tl|krs\.?|kurus|kr\.?)(?![a-z])",
+        normalized,
     ):
-        value = Decimal(amount.replace(",", "."))
-        values.add(value if unit == "tl" else value / 100)
+        value = _nominal_amount(amount, unit.rstrip("."))
+        if value is not None:
+            values.add(value)
     return values
 
 
@@ -357,13 +409,20 @@ def _columns(lines, before):
     raise ValueError("EPS table has no unambiguous period headers.")
 
 
-def _values(line, count):
+def _values(line, count, *, dot_decimal=False):
     matches = list(NUMBER.finditer(line))
     if len(matches) < count:
         return None
     if not re.fullmatch(r"[\s\d.,()–—-]+", line[matches[-count].start() :]):
         return None
-    return [parse_number(match[0]) for match in matches[-count:]]
+    return [
+        parse_number(match[0], dot_decimal=dot_decimal) for match in matches[-count:]
+    ]
+
+
+def _has_ambiguous_values(line, count):
+    matches = list(NUMBER.finditer(line))[-count:]
+    return any(is_ambiguous_thousands(match[0]) for match in matches)
 
 
 def _eps_unit(text):
@@ -482,23 +541,38 @@ def extract_pdf_eps(data, fiscal_year, fiscal_quarter, *, pages=None):
                 else sorted({Decimal(1), money})
             )
             unit = _eps_unit(lines[basic_row])
-            possible = []
-            for shares_scale in share_scales:
-                for candidate in [unit] if unit else ["TRY", "KURUS"]:
-                    scale = Decimal(".01") if candidate == "KURUS" else Decimal(1)
-                    comparable = [
-                        (s, p, b)
-                        for s, p, b in zip(shares, profit, basic)
-                        if s and p is not None and b is not None
-                    ]
-                    if comparable and all(
-                        abs(p * money / (s * shares_scale) - b * scale)
-                        <= abs(Decimal(1).scaleb(b.as_tuple().exponent))
-                        * Decimal("1.01")
-                        * scale
-                        for s, p, b in comparable
-                    ):
-                        possible.append((shares_scale, candidate))
+
+            def reconciling_units(
+                basic, shares=shares, profit=profit, money=money,
+                share_scales=share_scales, unit=unit,
+            ):
+                possible = []
+                for shares_scale in share_scales:
+                    for candidate in [unit] if unit else ["TRY", "KURUS"]:
+                        scale = Decimal(".01") if candidate == "KURUS" else Decimal(1)
+                        comparable = [
+                            (s, p, b)
+                            for s, p, b in zip(shares, profit, basic)
+                            if s and p is not None and b is not None
+                        ]
+                        if comparable and all(
+                            abs(p * money / (s * shares_scale) - b * scale)
+                            <= abs(Decimal(1).scaleb(b.as_tuple().exponent))
+                            * Decimal("1.01")
+                            * scale
+                            for s, p, b in comparable
+                        ):
+                            possible.append((shares_scale, candidate))
+                return possible
+
+            possible = reconciling_units(basic)
+            # "(25.870)" can be a dot-decimal EPS in an otherwise Turkish
+            # layout. Accept that reading only when profit/share inputs prove it.
+            if not possible and _has_ambiguous_values(lines[basic_row], count):
+                alternative = _values(lines[basic_row], count, dot_decimal=True)
+                possible = reconciling_units(alternative)
+                if possible:
+                    basic = alternative
             if len(possible) != 1:
                 if unit is not None and not possible:
                     raise ValueError(
@@ -576,7 +650,7 @@ def extract_pdf_eps(data, fiscal_year, fiscal_quarter, *, pages=None):
                     observations[(period_kind, kind, scope)] = selected
             excerpts.append({"page": page_number, "text": block})
         except (ValueError, StopIteration, ArithmeticError) as exc:
-            errors.append(f"page {page_number}: {exc}")
+            errors.append(f"page {page_number}: {str(exc) or type(exc).__name__}")
 
     # Face statements can disclose standalone quarterly EPS even where the note
     # contains only YTD weighted-average shares. Never subtract reported EPS.
@@ -596,6 +670,12 @@ def extract_pdf_eps(data, fiscal_year, fiscal_quarter, *, pages=None):
                 unit = _eps_unit(" ".join(lines[max(0, i - 2) : i + 1]))
                 if unit is None or values is None:
                     continue
+                if _has_ambiguous_values(line, len(periods)):
+                    # Face rows have no profit/share inputs to decide whether
+                    # "25.870" means 25870 or 25.87; never guess a 1000x unit.
+                    raise ValueError(
+                        "EPS face value has an ambiguous thousands/decimal separator."
+                    )
                 nominal = _nominal_value(pages, " ".join(lines[max(0, i - 2) : i + 1]))
                 kind = "diluted" if "sulandirilmis" in normalized else "basic"
                 scope = (

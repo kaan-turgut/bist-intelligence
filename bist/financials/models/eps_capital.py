@@ -75,6 +75,67 @@ class CapitalHistory:
         }
 
 
+    def bounds(self, start, end):
+        """Lowest/highest issued capital in effect between two dates."""
+        if start is None or end is None or end < start or not self.dates:
+            return None
+        first = max(bisect_right(self.dates, start) - 1, 0)
+        stop = bisect_right(self.dates, end)
+        values = [
+            r["capital"]
+            for r in self.rows[first:stop]
+            if r["capital"] is not None and r["capital"] > 0
+        ]
+        if not values or self.dates[first] > end:
+            return None
+        return min(values), max(values)
+
+
+# A verified EPS implies a nominal denominator (profit / EPS). Unit and nominal
+# extraction errors are powers of ten; corporate actions inside the band stay.
+PLAUSIBLE_DENOMINATOR_LOW = Decimal("0.25")
+PLAUSIBLE_DENOMINATOR_HIGH = Decimal(2)
+# IAS 33 restates EPS for bonus issues approved before the report is issued.
+POST_PERIOD_CAPITAL_DAYS = 120
+
+
+def implausible_verified_eps(verified, profit, start, end, capital, paid_capital=None):
+    """Return evidence when verified EPS contradicts dated issued capital.
+
+    Historical capital is only a plausibility bound here; it never replaces the
+    disclosed denominator. Returns None when the check passes or is not possible.
+    """
+    if verified is None or profit is None or verified == 0 or profit == 0:
+        return None
+    bounds = (
+        capital.bounds(start, end + timedelta(days=POST_PERIOD_CAPITAL_DAYS))
+        if capital is not None
+        else None
+    )
+    source = "IsYatirim.SERMAYE"
+    if bounds is None and paid_capital:
+        bounds, source = (paid_capital, paid_capital), "reported_paid_in_capital"
+    if bounds is None:
+        return None
+    # Only magnitude is tested: a sign disagreement can also come from the
+    # Gold profit (for example a derived quarter), so it is not proof of an
+    # EPS unit error.
+    implied = abs(profit / verified)
+    low = bounds[0] * PLAUSIBLE_DENOMINATOR_LOW
+    high = bounds[1] * PLAUSIBLE_DENOMINATOR_HIGH
+    if low <= implied <= high:
+        return None
+    return {
+        "reason": "verified_eps_implies_implausible_nominal_denominator",
+        "verified_value": str(verified),
+        "parent_profit": str(profit),
+        "implied_nominal_denominator": str(implied),
+        "capital_bounds": [str(bounds[0]), str(bounds[1])],
+        "capital_source": source,
+        "accepted_band": [str(PLAUSIBLE_DENOMINATOR_LOW), str(PLAUSIBLE_DENOMINATOR_HIGH)],
+    }
+
+
 def verified_share_basis(observation, capital):
     """A constant issued-capital regime rules out unhandled bonus-capital changes.
 

@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from psycopg.types.json import Jsonb
 
-from bist.financials.models.eps_capital import CapitalHistory
+from bist.financials.models.eps_capital import CapitalHistory, implausible_verified_eps
 from bist.financials.models.financial_values import CpiSeries
 
 ZERO_MINORITY = """COALESCE((SELECT bool_and(COALESCE(minority.value_ytd=0
@@ -223,7 +223,8 @@ def calculate_eps_coverage(conn, run_id, capital=None, cpi=None, company_ids=Non
     for row in rows:
         key = (row["company_id"], row["fiscal_year"], row["fiscal_quarter"])
         fact, history = profits.get(key), capital.get(row["company_id"])
-        estimates, evidence, statuses = {}, {}, {}
+        estimates, evidence, statuses, rejections = {}, {}, {}, {}
+        row = dict(row)
         for kind in ("quarter", "ytd", "ttm"):
             value = None
             reason = "missing_or_ambiguous_parent_attributable_profit"
@@ -285,6 +286,20 @@ def calculate_eps_coverage(conn, run_id, capital=None, cpi=None, company_ids=Non
                                         str(f) for f in factors
                                     ]
                 if amount is not None and start and end:
+                    reported_capital = paid_capital.get(key)
+                    rejection = implausible_verified_eps(
+                        row["value_" + kind],
+                        amount,
+                        start,
+                        end,
+                        history,
+                        reported_capital["capital"]
+                        if reported_capital and reported_capital["period_end"] == end
+                        else None,
+                    )
+                    if rejection:
+                        rejections[kind] = rejection
+                        row["value_" + kind] = None
                     denominator = (
                         history.period(start, end, allow_opening_estimate=True)
                         if history
@@ -346,6 +361,8 @@ def calculate_eps_coverage(conn, run_id, capital=None, cpi=None, company_ids=Non
                 if row["value_" + kind] is not None
                 else reason,
             }
+            if kind in rejections:
+                statuses[kind]["verified_rejected"] = rejections[kind]["reason"]
             counts[kind + "_" + statuses[kind]["status"]] += 1
         assessment = {
             "unit": "TRY_per_1_TRY_nominal",
@@ -361,7 +378,8 @@ def calculate_eps_coverage(conn, run_id, capital=None, cpi=None, company_ids=Non
             "capital_source": "IsYatirim.SERMAYE",
             "capital_history_sha256": fingerprints.get(row["company_id"]),
             "evidence": evidence,
-            "review_required": any(
+            "verified_rejections": rejections,
+            "review_required": bool(rejections) or any(
                 s["status"] == "review_required" for s in statuses.values()
             ),
         }
@@ -380,4 +398,67 @@ def calculate_eps_coverage(conn, run_id, capital=None, cpi=None, company_ids=Non
                 Jsonb(assessment),
             ),
         )
+        if rejections:
+            counts["verified_rejected"] += len(rejections)
+            reject_verified_eps(conn, run_id, key, rejections)
     return dict(counts)
+
+
+def reject_verified_eps(conn, run_id, key, rejections):
+    """Withdraw implausible verified EPS fields from every type sharing a source.
+
+    The original value and evidence stay in calculation_details so the source
+    can be reviewed; downstream ratios then use the labelled estimate fallback.
+    """
+    values = conn.execute(
+        """SELECT eps_kind,share_class,earnings_scope,value_quarter,value_ytd,value_ttm,
+        calculation_details FROM gold.eps_values WHERE calculation_run_id=%s
+        AND company_id=%s AND fiscal_year=%s AND fiscal_quarter=%s""",
+        (run_id, *key),
+    ).fetchall()
+
+    def sources(row, kind):
+        details = row["calculation_details"] or {}
+        return set(details.get("ttm_source_ids" if kind == "ttm" else "source_ids") or [])
+
+    primary = next(
+        (
+            r
+            for r in values
+            if (r["eps_kind"], r["share_class"], r["earnings_scope"])
+            == ("basic", "ordinary", "total")
+        ),
+        None,
+    )
+    for row in values:
+        details = dict(row["calculation_details"] or {})
+        changed = {}
+        for kind, evidence in rejections.items():
+            value = row["value_" + kind]
+            if value is None:
+                continue
+            if row is not primary and not (
+                primary and sources(row, kind) & sources(primary, kind)
+            ):
+                continue
+            changed[kind] = {**evidence, "withdrawn_value": str(value)}
+        if not changed:
+            continue
+        details["plausibility_rejections"] = {
+            **details.get("plausibility_rejections", {}),
+            **changed,
+        }
+        assignments = ",".join(f"value_{kind}=NULL" for kind in changed)
+        conn.execute(
+            f"""UPDATE gold.eps_values SET {assignments},calculation_details=%s
+            WHERE calculation_run_id=%s AND company_id=%s AND fiscal_year=%s
+            AND fiscal_quarter=%s AND eps_kind=%s AND share_class=%s AND earnings_scope=%s""",
+            (
+                Jsonb(details),
+                run_id,
+                *key,
+                row["eps_kind"],
+                row["share_class"],
+                row["earnings_scope"],
+            ),
+        )
