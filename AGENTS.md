@@ -26,7 +26,7 @@ ruff check .
 - Activity report PostgreSQL tests use [tests/activity_reports/conftest.py](tests/activity_reports/conftest.py). Set `BIST_TEST_DSN` to a separate, disposable `bist_finance` database that already has the shared schema.
 - PostgreSQL tests are skipped when their variable is unset. No test calls paid APIs.
 - The CLIs connect through `BIST_FINANCE_DSN`, then `DATABASE_URL`, then the local `dbname=bist_finance` default. For CLI smoke tests that write data, explicitly set `BIST_FINANCE_DSN` to a disposable `bist_finance` database. `python -m bist.financials init-postgres` applies the shared schema and seeds empty metadata; the optional `--create-database` flag requires `CREATEDB`.
-- Keep downloads out of Git: archives under `financial_statements/<SYMBOL>/<SYMBOL>_<YEAR>.zip` and PDFs under `activity_reports/<SYMBOL>/`. The repository keeps a few THYAO samples locally for offline checks. `run --skip-download --skip-reference-data` reuses retained archives and reference data.
+- Keep downloads and backups out of Git: archives under `financial_statements/<SYMBOL>/<SYMBOL>_<YEAR>.zip`, PDFs under `activity_reports/<SYMBOL>/`, and pre-repair table exports under `database_backups/`. The local checkout holds the full downloaded set (about 33 GB), so use retained files for offline checks. `run --skip-download --skip-reference-data` reuses retained archives and reference data.
 
 ## Financial data and publication
 
