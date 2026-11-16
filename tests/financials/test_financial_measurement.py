@@ -8,14 +8,17 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from bist.financials.models.financial_values import CpiSeries, calculate_values
+from bist.financials.models.financial_values import (
+    CpiSeries,
+    add_period_changes,
+    calculate_values,
+)
 from bist.financials.services import postgres_financial_pipeline as pipeline
 from bist.financials.services import repair_financials
 from bist.financials.services.financial_report_context import (
     infer_context,
     store_context,
 )
-from bist.financials.services.financial_values import calculate_value_changes
 
 
 def fact(
@@ -295,37 +298,57 @@ def test_monthly_fx_matches_a_trading_date_after_the_first_and_noncalendar_end(
     assert result["value_ytd"] == 300
 
 
-def test_financial_growth_never_bridges_missing_periods(database):
-    conn, company, run = database
-    for year, q, end, amount in [
-        (2022, 1, "2022-03-31", 100),
-        (2024, 1, "2024-03-31", 200),
-        (2024, 3, "2024-09-30", 300),
-        (2024, 4, "2024-12-31", 600),
-    ]:
-        conn.execute(
-            """INSERT INTO gold.financial_values
-            (calculation_run_id,company_id,statement_type,fiscal_year,fiscal_quarter,line_item_path,item,value_real,period_end,measurement_basis)
-            VALUES (%s,%s,'balance_sheet',%s,%s,'assets','assets',%s,%s,'nominal')""",
-            (run, company, year, q, amount, end),
-        )
-    calculate_value_changes(conn, run)
-    result = conn.execute(
-        "SELECT * FROM gold.financial_values ORDER BY fiscal_year,fiscal_quarter"
-    ).fetchall()
-    assert result[1]["value_real_yoy_change"] is None
-    assert result[2]["value_real_qoq_change"] is None
-    assert result[3]["value_real_qoq_change"] == 1
-    conn.execute(
-        "UPDATE gold.financial_values SET measurement_basis='inflation_adjusted' WHERE fiscal_year=2024 AND fiscal_quarter=4"
-    )
-    calculate_value_changes(conn, run)
-    assert (
-        conn.execute(
-            "SELECT value_real_qoq_change FROM gold.financial_values WHERE fiscal_year=2024 AND fiscal_quarter=4"
-        ).fetchone()["value_real_qoq_change"]
-        is None
-    )
+def growth_row(year, quarter, end, value, basis="nominal", item="assets"):
+    return {
+        "company_id": 1, "statement_type": "balance_sheet", "line_item_path": item,
+        "item": item, "source_column_id": None, "fiscal_year": year,
+        "fiscal_quarter": quarter, "period_end": date.fromisoformat(end),
+        "measurement_basis": basis, "value_real": Decimal(value),
+    }
+
+
+def test_financial_growth_never_bridges_missing_periods():
+    rows = add_period_changes([
+        growth_row(2022, 1, "2022-03-31", 100),
+        growth_row(2024, 1, "2024-03-31", 200),
+        growth_row(2024, 3, "2024-09-30", 300),
+        growth_row(2024, 4, "2024-12-31", 600),
+    ])
+    assert rows[1]["value_real_yoy_change"] is None  # 2022 Q1 is two years earlier
+    assert rows[2]["value_real_qoq_change"] is None  # Q2 is missing
+    assert rows[3]["value_real_qoq_change"] == 1
+    rows[3]["measurement_basis"] = "inflation_adjusted"
+    assert add_period_changes(rows)[3]["value_real_qoq_change"] is None
+
+
+def test_financial_growth_uses_same_quarter_and_day_bounds():
+    rows = add_period_changes([
+        growth_row(2023, 2, "2023-06-30", 50),
+        growth_row(2023, 3, "2023-09-30", 0),
+        growth_row(2023, 4, "2023-12-31", 80),
+        growth_row(2024, 2, "2024-06-30", 75),
+        growth_row(2024, 3, "2024-09-30", 10),
+        growth_row(2024, 4, "2025-03-31", 90),  # 456 days after 2023 Q4
+        growth_row(2024, 2, "2024-06-30", 1, item="other line"),
+    ])
+    assert rows[3]["value_real_yoy_change"] == Decimal("0.5")
+    assert rows[4]["value_real_yoy_change"] is None  # the prior value is zero
+    assert rows[5]["value_real_yoy_change"] is None
+    assert rows[5]["value_real_qoq_change"] is None  # 182 days after Q3
+    assert rows[6]["value_real_yoy_change"] is None  # other lines never mix
+
+
+def test_financial_growth_rounds_like_postgresql_numeric_division():
+    # Expected values are PostgreSQL's own results for
+    # ((a::numeric(28,6) / b::numeric(28,6)) - 1)::numeric(28,10).
+    rows = add_period_changes([
+        growth_row(2024, 1, "2024-03-31", "0.000007"),
+        growth_row(2024, 2, "2024-06-30", "123456789.123456"),
+        growth_row(2024, 3, "2024-09-30", "1.0000004"),  # stored as 1.000000
+    ])
+    # Only 16 significant digits survive PostgreSQL's division (not ...2.7142857143).
+    assert rows[1]["value_real_qoq_change"] == Decimal("17636684160492.7142860000")
+    assert rows[2]["value_real_qoq_change"] == Decimal("-0.9999999919")
 
 
 def test_repair_restores_reported_quarter_and_ytd_and_is_atomic(database, monkeypatch):

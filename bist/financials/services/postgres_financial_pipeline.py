@@ -502,34 +502,27 @@ def _calculate_gold_financials_postgres(*, companies=None):
 
 def _calculate_gold_stages(conn, run_id, price_level_year, price_level_month, companies):
     """Calculate and publish one Gold run inside the caller's transaction."""
-    from bist.financials.services.financial_values import (
-        calculate_financial_values,
-        calculate_value_changes,
-    )
+    from bist.financials.services.financial_values import calculate_financial_values
 
     stage_started = time.perf_counter()
-    logger.info("Gold stage 1/5: calculating values using source periods and measurement bases")
+    logger.info("Gold stage 1/4: calculating values and period changes using source periods and measurement bases")
     calculate_financial_values(conn, run_id, price_level_year, price_level_month, companies, CASH_BALANCE_ITEMS)
-    logger.info("Gold stage 1/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+    logger.info("Gold stage 1/4 complete in %.1f seconds", time.perf_counter() - stage_started)
     conn.execute("ANALYZE gold.financial_values")
-    stage_started = time.perf_counter()
-    logger.info("Gold stage 2/5: calculating changes across exact adjacent periods")
-    calculate_value_changes(conn, run_id)
-    logger.info("Gold stage 2/5 complete in %.1f seconds", time.perf_counter() - stage_started)
 
     stage_started = time.perf_counter()
-    logger.info("Gold stage 3/5: calculating financial ratios")
+    logger.info("Gold stage 2/4: calculating financial ratios")
     calculate_financial_ratios(conn, run_id)
-    logger.info("Gold stage 3/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+    logger.info("Gold stage 2/4 complete in %.1f seconds", time.perf_counter() - stage_started)
 
     stage_started = time.perf_counter()
-    logger.info("Gold stage 4/5: calculating ratio changes")
+    logger.info("Gold stage 3/4: calculating ratio changes")
     calculate_ratio_changes(conn, run_id)
-    logger.info("Gold stage 4/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+    logger.info("Gold stage 3/4 complete in %.1f seconds", time.perf_counter() - stage_started)
 
     stage_started = time.perf_counter()
-    logger.info("Gold stage 5/5: recording data-quality results and publishing active calculation run")
-    timer = StepTimer(logger, "Gold stage 5")
+    logger.info("Gold stage 4/4: recording data-quality results and publishing active calculation run")
+    timer = StepTimer(logger, "Gold stage 4")
     conn.execute("""INSERT INTO ops.data_quality_results
         (run_id,check_name,severity,affected_rows,details)
         SELECT %s,'financial_rows_missing_cpi','warning',COUNT(*),
@@ -573,7 +566,7 @@ def _calculate_gold_stages(conn, run_id, price_level_year, price_level_month, co
         WHERE calculation_run_id=%s GROUP BY company_id
         ON CONFLICT (dataset_name,company_id) DO UPDATE
         SET run_id=EXCLUDED.run_id,activated_at=now()""", (run_id, run_id))
-    logger.info("Gold stage 5/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+    logger.info("Gold stage 4/4 complete in %.1f seconds", time.perf_counter() - stage_started)
 
 
 def calculate_gold_financials_postgres(*, companies=None):

@@ -302,3 +302,71 @@ def test_cumulative_differences_require_immediate_previous_period(database, incl
     q4 = conn.execute("""SELECT value_quarter FROM gold.current_financial_values
         WHERE fiscal_year=2024 AND fiscal_quarter=4 AND item='hasılat'""").fetchone()
     assert q4["value_quarter"] == (400 if include_q3 else None)
+
+
+# The SQL that computed the change columns before stage 1 took over; kept as the oracle.
+SQL_PERIOD_CHANGES = """WITH previous AS (
+    SELECT financial_value_id,value_real,fiscal_year,fiscal_quarter,period_end,measurement_basis,
+        LAG(measurement_basis) OVER annual AS annual_basis,
+        LAG(measurement_basis) OVER sequential AS preceding_basis,
+        LAG(value_real) OVER annual AS annual_value,LAG(fiscal_year) OVER annual AS annual_year,
+        LAG(period_end) OVER annual AS annual_end,
+        LAG(value_real) OVER sequential AS preceding_value,
+        LAG(fiscal_year*4+fiscal_quarter) OVER sequential AS preceding_period,
+        LAG(period_end) OVER sequential AS preceding_end
+    FROM gold.financial_values WHERE calculation_run_id=%s
+    WINDOW annual AS (PARTITION BY company_id,statement_type,line_item_path,item,source_column_id,fiscal_quarter ORDER BY fiscal_year),
+           sequential AS (PARTITION BY company_id,statement_type,line_item_path,item,source_column_id ORDER BY fiscal_year,fiscal_quarter)
+) SELECT financial_value_id,
+    (CASE WHEN annual_year=fiscal_year-1 AND period_end-annual_end BETWEEN 350 AND 380
+          AND measurement_basis=annual_basis THEN value_real/NULLIF(annual_value,0)-1 END)::numeric(28,10) AS yoy,
+    (CASE WHEN preceding_period=fiscal_year*4+fiscal_quarter-1 AND period_end-preceding_end BETWEEN 75 AND 100
+          AND measurement_basis=preceding_basis THEN value_real/NULLIF(preceding_value,0)-1 END)::numeric(28,10) AS qoq
+  FROM previous"""
+
+
+def test_stage_one_period_changes_match_the_former_sql(database, price_level):
+    conn, company, run = database
+    from bist.financials.services.financial_report_context import store_context
+
+    periods = [(y, q) for y in (2022, 2023, 2024) for q in (1, 2, 3, 4) if (y, q) != (2023, 2)]
+    for index, (year, quarter) in enumerate(periods):
+        for statement, item, amount in (
+            ("income_statement", "hasılat", 100 + index * 37),
+            ("income_statement", "dönem karı (zararı)", (-1) ** index * (3 + index)),
+            ("balance_sheet", "toplam varlıklar", 1000 + index * index * 11),
+        ):
+            filing = conn.execute("""INSERT INTO bronze.statement_filings
+                (company_id,fiscal_year,fiscal_quarter,statement_type,source_filename,source_path,source_sha256)
+                VALUES (%s,%s,%s,%s,'test.xls','test.zip/test.xls','test')
+                ON CONFLICT (company_id,fiscal_year,fiscal_quarter,statement_type,source_sha256)
+                DO UPDATE SET source_filename=EXCLUDED.source_filename RETURNING filing_key""",
+                (company, year, quarter, statement)).fetchone()["filing_key"]
+            store_context(conn, filing, run, {"measurement_basis": "nominal", "purchasing_power_date": None,
+                                              "evidence": {"source": "synthetic nominal fixture"}})
+            path = "profit or loss > " + item if statement == "income_statement" else item
+            conn.execute("""INSERT INTO silver.financial_observations
+                (company_id,filing_key,processing_run_id,statement_type,fiscal_year,fiscal_quarter,
+                 period_start,period_end,line_item_path,item,amount)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (company, filing, run, statement, year, quarter, date(year, quarter*3-2, 1),
+                 date(year, quarter*3, calendar.monthrange(year, quarter*3)[1]), path, item, amount))
+            conn.execute("""INSERT INTO ops.active_filing_versions
+                (company_id,statement_type,fiscal_year,fiscal_quarter,filing_key,processing_run_id)
+                VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                (company, statement, year, quarter, filing, run))
+    # Uneven monthly inflation so real values carry long decimal expansions.
+    conn.execute("""UPDATE silver.monthly_macro_data SET value=(EXTRACT(MONTH FROM observation_date)::int % 5)+0.37
+        WHERE series_code='CPI_MONTHLY_RATE' AND year BETWEEN 2022 AND 2024""")
+    conn.commit()
+    price_level(2024, 12)
+    gold_run = pipeline.calculate_gold_financials_postgres(companies=[SimpleNamespace(symbol="TEST")])
+
+    expected = {r["financial_value_id"]: (r["yoy"], r["qoq"])
+                for r in conn.execute(SQL_PERIOD_CHANGES, (gold_run,))}
+    stored = {r["financial_value_id"]: (r["value_real_yoy_change"], r["value_real_qoq_change"])
+              for r in conn.execute("""SELECT financial_value_id,value_real_yoy_change,value_real_qoq_change
+                  FROM gold.financial_values WHERE calculation_run_id=%s""", (gold_run,))}
+    assert stored == expected
+    filled = [pair for pair in stored.values() if pair != (None, None)]
+    assert len(filled) > 20 and any(None in pair for pair in stored.values())

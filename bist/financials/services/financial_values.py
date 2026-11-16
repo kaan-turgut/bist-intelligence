@@ -4,7 +4,11 @@ from datetime import date
 
 from psycopg.types.json import Jsonb
 
-from bist.financials.models.financial_values import CpiSeries, calculate_values
+from bist.financials.models.financial_values import (
+    CpiSeries,
+    add_period_changes,
+    calculate_values,
+)
 from bist.financials.parsing.borrowing_paths import (
     BORROWING_PATH_ITEMS,
     borrowing_path_overrides,
@@ -62,7 +66,7 @@ def calculate_financial_values(conn, run_id, year, month, companies, cash_balanc
             (run_id,check_name,severity,affected_rows,details)
             VALUES (%s,'borrowing_counterparty_paths_restored','info',%s,%s)""",
             (run_id, restored, Jsonb({"source": "ordered_bronze_parent_rows"})))
-    values = calculate_values(observations, cpi, target, cash_balances)
+    values = add_period_changes(calculate_values(observations, cpi, target, cash_balances))
     labels = {
         (r["filing_key"], r["source_row_id"], r["source_column_id"]): r["column_label"]
         for r in conn.execute("""SELECT DISTINCT ON (filing_key,source_row_id,source_column_id)
@@ -81,7 +85,8 @@ def calculate_financial_values(conn, run_id, year, month, companies, cash_balanc
         (calculation_run_id,company_id,statement_type,fiscal_year,fiscal_quarter,line_item_path,item,
          source_column_id,column_label,value_quarter,value_ytd,value_real,value_usd,
          inflation_base_year,inflation_base_month,period_start,period_end,measurement_basis,
-         purchasing_power_date,calculation_details,value_real_ytd) FROM STDIN""") as copied
+         purchasing_power_date,calculation_details,value_real_ytd,
+         value_real_yoy_change,value_real_qoq_change) FROM STDIN""") as copied
     ):
         for row in values:
             end = row["period_end"]
@@ -124,32 +129,7 @@ def calculate_financial_values(conn, run_id, year, month, companies, cash_balanc
                     row.get("purchasing_power_date"),
                     Jsonb(details),
                     row["value_real_ytd"],
+                    row["value_real_yoy_change"],
+                    row["value_real_qoq_change"],
                 )
             )
-
-
-def calculate_value_changes(conn, run_id):
-    conn.execute(
-        """WITH previous AS MATERIALIZED (
-        SELECT financial_value_id,value_real,fiscal_year,fiscal_quarter,period_end,measurement_basis,
-            LAG(measurement_basis) OVER annual AS annual_basis,
-            LAG(measurement_basis) OVER sequential AS preceding_basis,
-            LAG(value_real) OVER annual AS annual_value,LAG(fiscal_year) OVER annual AS annual_year,
-            LAG(period_end) OVER annual AS annual_end,
-            LAG(value_real) OVER sequential AS preceding_value,
-            LAG(fiscal_year*4+fiscal_quarter) OVER sequential AS preceding_period,
-            LAG(period_end) OVER sequential AS preceding_end
-        FROM gold.financial_values WHERE calculation_run_id=%s
-        WINDOW annual AS (PARTITION BY company_id,statement_type,line_item_path,item,source_column_id,fiscal_quarter ORDER BY fiscal_year),
-               sequential AS (PARTITION BY company_id,statement_type,line_item_path,item,source_column_id ORDER BY fiscal_year,fiscal_quarter)
-    ) UPDATE gold.financial_values g SET
-        value_real_yoy_change=CASE WHEN p.annual_year=p.fiscal_year-1 AND p.period_end-p.annual_end BETWEEN 350 AND 380
-                                  AND p.measurement_basis=p.annual_basis
-                                  THEN p.value_real/NULLIF(p.annual_value,0)-1 END,
-        value_real_qoq_change=CASE WHEN p.preceding_period=p.fiscal_year*4+p.fiscal_quarter-1
-                                       AND p.period_end-p.preceding_end BETWEEN 75 AND 100
-                                       AND p.measurement_basis=p.preceding_basis
-                                  THEN p.value_real/NULLIF(p.preceding_value,0)-1 END
-        FROM previous p WHERE g.financial_value_id=p.financial_value_id AND g.calculation_run_id=%s""",
-        (run_id, run_id),
-    )

@@ -17,7 +17,7 @@ def calculate_financial_ratios(conn, run_id):
     Trailing flows and opening/closing balances use the common CPI base in
     value_real. EPS is handled separately using period-specific disclosures.
     """
-    timer = StepTimer(logger, "Gold stage 3")
+    timer = StepTimer(logger, "Gold stage 2")
     conn.execute("""WITH facts AS (
         SELECT company_id, fiscal_year, fiscal_quarter,
             fiscal_year*4+fiscal_quarter AS period_number,

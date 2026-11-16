@@ -3,7 +3,7 @@
 import calendar
 from collections import defaultdict
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from itertools import pairwise
 
 
@@ -206,3 +206,89 @@ def calculate_values(observations, cpi, target_date, cash_balances):
             )
         results[key] = current
     return list(results.values())
+
+
+STORED_REAL = Decimal("0.000001")  # gold.financial_values.value_real is numeric(28,6)
+STORED_CHANGE = Decimal("0.0000000001")  # value_real_*_change columns are numeric(28,10)
+
+
+def _stored(value, places):
+    """Round like PostgreSQL storing into a numeric column (ties away from zero)."""
+    return None if value is None else Decimal(value).quantize(places, ROUND_HALF_UP)
+
+
+def _nbase_digit(value):
+    """PostgreSQL numeric weight and leading digit in base 10,000."""
+    weight = abs(value).adjusted() // 4
+    return weight, int(abs(value).scaleb(-4 * weight))
+
+
+def _postgres_divide(dividend, divisor):
+    """Divide like PostgreSQL's numeric operator, which keeps at least 16 significant digits.
+
+    Mirrors select_div_scale in PostgreSQL's numeric.c so stored results are
+    identical to what the database computes; both inputs have scale 6.
+    """
+    if dividend == 0:
+        return Decimal(0)
+    weight1, first1 = _nbase_digit(dividend)
+    weight2, first2 = _nbase_digit(divisor)
+    quotient_weight = weight1 - weight2 - (1 if first1 <= first2 else 0)
+    scale = max(16 - quotient_weight * 4, -STORED_REAL.as_tuple().exponent, 0)
+    with localcontext() as context:
+        context.prec = 1000
+        return (dividend / divisor).quantize(Decimal(1).scaleb(-scale), ROUND_HALF_UP)
+
+
+def _period(row):
+    return row["fiscal_year"] * 4 + row["fiscal_quarter"]
+
+
+def _change(current, prior, prior_period, min_days, max_days):
+    if prior is None or _period(prior) != prior_period:
+        return None
+    if current["period_end"] is None or prior["period_end"] is None:
+        return None
+    if not min_days <= (current["period_end"] - prior["period_end"]).days <= max_days:
+        return None
+    if current["measurement_basis"] != prior["measurement_basis"]:
+        return None
+    value = _stored(current["value_real"], STORED_REAL)
+    previous = _stored(prior["value_real"], STORED_REAL)
+    if value is None or previous is None or previous == 0:
+        return None
+    return _stored(_postgres_divide(value, previous) - 1, STORED_CHANGE)
+
+
+def add_period_changes(values):
+    """Set real year-over-year and quarter-over-quarter changes on calculated values.
+
+    A line item (company, statement, path, item and source column) is compared
+    only with itself in the same quarter one fiscal year earlier (350-380 days
+    apart) or in the immediately preceding quarter (75-100 days apart), and only
+    when both periods share a measurement basis; missing periods are never
+    bridged. Inputs are rounded as stored, so results match the table's values.
+    """
+    lines = defaultdict(list)
+    for row in values:
+        lines[
+            (
+                row["company_id"],
+                row["statement_type"],
+                row["line_item_path"],
+                row["item"],
+                row["source_column_id"],
+            )
+        ].append(row)
+    for rows in lines.values():
+        rows.sort(key=lambda r: (r["fiscal_year"], r["fiscal_quarter"]))
+        same_quarter, preceding = {}, None
+        for row in rows:
+            period = _period(row)
+            row["value_real_qoq_change"] = _change(row, preceding, period - 1, 75, 100)
+            row["value_real_yoy_change"] = _change(
+                row, same_quarter.get(row["fiscal_quarter"]), period - 4, 350, 380
+            )
+            same_quarter[row["fiscal_quarter"]] = row
+            preceding = row
+    return values
