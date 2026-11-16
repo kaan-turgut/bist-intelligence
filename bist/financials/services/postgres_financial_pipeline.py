@@ -28,6 +28,7 @@ from bist.financials.services.price_level import (
     require_price_level,
     warn_if_stale,
 )
+from bist.logging_config import StepTimer
 from bist.paths import FINANCIAL_STATEMENTS_DIR, MIGRATIONS_DIR
 
 logger = logging.getLogger(__name__)
@@ -528,6 +529,7 @@ def _calculate_gold_stages(conn, run_id, price_level_year, price_level_month, co
 
     stage_started = time.perf_counter()
     logger.info("Gold stage 5/5: recording data-quality results and publishing active calculation run")
+    timer = StepTimer(logger, "Gold stage 5")
     conn.execute("""INSERT INTO ops.data_quality_results
         (run_id,check_name,severity,affected_rows,details)
         SELECT %s,'financial_rows_missing_cpi','warning',COUNT(*),
@@ -551,18 +553,21 @@ def _calculate_gold_stages(conn, run_id, price_level_year, price_level_month, co
     # active pointer is per company. Prune all older rows for those companies,
     # including periods that no longer exist (e.g. a cash flow once stored in
     # an erroneous Q4 slot), so no unreachable Gold rows linger.
+    timer.mark("data-quality checks")
     conn.execute("""DELETE FROM gold.financial_ratios old
         WHERE old.calculation_run_id<>%s
           AND old.company_id IN (
             SELECT DISTINCT company_id FROM gold.financial_values
             WHERE calculation_run_id=%s
           )""", (run_id, run_id))
+    timer.mark("pruning superseded ratios")
     conn.execute("""DELETE FROM gold.financial_values old
         WHERE old.calculation_run_id<>%s
           AND old.company_id IN (
             SELECT DISTINCT company_id FROM gold.financial_values
             WHERE calculation_run_id=%s
           )""", (run_id, run_id))
+    timer.mark("pruning superseded values")
     conn.execute("""INSERT INTO ops.active_company_versions (dataset_name,company_id,run_id)
         SELECT 'financials',company_id,%s FROM gold.financial_values
         WHERE calculation_run_id=%s GROUP BY company_id

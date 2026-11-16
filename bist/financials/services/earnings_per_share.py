@@ -22,6 +22,7 @@ from bist.financials.models.earnings_per_share import (
     calculate_history,
     normalize_observation,
 )
+from bist.logging_config import StepTimer
 
 logger = logging.getLogger(__name__)
 EPS_GROUPS = (
@@ -443,6 +444,7 @@ def _prepared_eps_filings(filings, workers):
 
 
 def calculate_eps_ratios(conn, run_id, company_ids=None):
+    timer = StepTimer(logger, "EPS")
     condition = " AND company_id=ANY(%s)" if company_ids is not None else ""
     params = (run_id, company_ids) if company_ids is not None else (run_id,)
     periods = conn.execute(
@@ -559,14 +561,18 @@ def calculate_eps_ratios(conn, run_id, company_ids=None):
                     ),
                 )
 
+    timer.mark("EPS values")
     logger.info(
         "EPS coverage assessment: %s",
         calculate_eps_coverage(conn, run_id, capital, cpi, company_ids),
     )
+    timer.mark("EPS coverage")
     publish_eps_ratio(conn, run_id, company_ids)
+    timer.mark("eps ratio")
     from bist.financials.services.eps_inflation import publish_eps_inflation_ratio
 
     publish_eps_inflation_ratio(conn, run_id, company_ids, cpi)
+    timer.mark("eps_inflation_adj ratio")
 
 
 def publish_eps_ratio(conn, run_id, company_ids=None):

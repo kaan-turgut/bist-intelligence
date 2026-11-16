@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 from psycopg.types.json import Jsonb
 
+from bist.logging_config import StepTimer
+
 logger = logging.getLogger(__name__)
 
 # Shared by Gold calculations, EPS refreshes, price adjustments and rebases.
@@ -250,6 +252,7 @@ def set_price_level(year, month):
                 "Rebasing from %s to %s: %s published companies and all price series",
                 format_price_level(previous), format_price_level(level), len(companies),
             )
+            timer = StepTimer(logger, "Price level rebase")
             gold_run = None
             if companies:
                 gold_run = financials._run_start(conn, "gold_financial_calculation", {
@@ -259,6 +262,7 @@ def set_price_level(year, month):
                 })
                 financials._calculate_gold_stages(conn, gold_run, year, month, companies)
                 financials._run_finish(conn, gold_run)
+                timer.mark(f"Gold recalculation for {len(companies)} companies")
             price_run = None
             if conn.execute("SELECT 1 FROM silver.daily_prices LIMIT 1").fetchone():
                 price_run = prices._run_start(conn, "gold_price_adjustment", {
@@ -268,6 +272,7 @@ def set_price_level(year, month):
                 })
                 prices._adjust_price_stages(conn, price_run, year, month, None)
                 prices._run_finish(conn, price_run)
+                timer.mark("price series recalculation")
             _store_price_level(conn, level, rebase_run, {
                 "source": "set_price_level",
                 "gold_run_id": gold_run,
@@ -275,8 +280,10 @@ def set_price_level(year, month):
                 "companies": len(companies),
             })
             check_price_level(conn, rebase_run, level)
+            timer.mark("consistency check")
             financials._run_finish(conn, rebase_run)
             conn.commit()
+            timer.mark("commit")
         except BaseException as exc:
             conn.rollback()
             financials._run_finish(conn, rebase_run, exc)

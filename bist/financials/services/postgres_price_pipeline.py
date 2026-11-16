@@ -30,6 +30,7 @@ from bist.financials.services.price_level import (
     require_price_level,
     warn_if_stale,
 )
+from bist.logging_config import StepTimer
 
 logger = logging.getLogger(__name__)
 _PRICE_ADJUST_RUN_ID = ContextVar("price_adjust_run_id", default=None)
@@ -160,6 +161,7 @@ def _price_instrument_ids(conn, symbols):
 def _adjust_price_stages(conn, run_id, year, month, symbol_ids):
     """Publish real prices at ``year``-``month`` inside the caller's transaction."""
     filter_sql = " AND p.instrument_id=ANY(%s)" if symbol_ids is not None else ""
+    timer = StepTimer(logger, "Price adjustment")
     conn.execute("""WITH cpi_index AS (
         SELECT observation_date,
                EXP(SUM(LN(1 + value / 100.0)) OVER (ORDER BY observation_date)) AS price_index
@@ -196,12 +198,14 @@ def _adjust_price_stages(conn, run_id, year, month, symbol_ids):
         inflation_base_month=EXCLUDED.inflation_base_month,
         close_real_method=EXCLUDED.close_real_method,calculated_at=now()""",
     [year, month, year, month, run_id, *([symbol_ids] if symbol_ids is not None else [])])
+    timer.mark("real price insert")
     conn.execute("""DELETE FROM gold.price_series old
         USING gold.price_series current
         WHERE current.calculation_run_id=%s
           AND old.calculation_run_id<>%s
           AND old.instrument_id=current.instrument_id
           AND old.price_date=current.price_date""", (run_id, run_id))
+    timer.mark("pruning superseded prices")
     conn.execute("""INSERT INTO ops.active_instrument_versions (dataset_name,instrument_id,run_id)
         SELECT 'prices',instrument_id,%s FROM gold.price_series
         WHERE calculation_run_id=%s GROUP BY instrument_id
@@ -221,6 +225,7 @@ def _adjust_price_stages(conn, run_id, year, month, symbol_ids):
         FROM gold.price_series
         WHERE calculation_run_id=%s AND close_real_method='latest_cpi_carried_forward'""",
         (run_id, run_id))
+    timer.mark("activation and data-quality checks")
 
 
 def _adjust_prices_postgres(symbols=None):

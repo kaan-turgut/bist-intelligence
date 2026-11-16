@@ -1,9 +1,14 @@
 """Calculate financial ratios and publish the best available basic EPS."""
 
+import logging
+
 from bist.financials.services.earnings_per_share import (
     calculate_eps_changes,
     calculate_eps_ratios,
 )
+from bist.logging_config import StepTimer
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_financial_ratios(conn, run_id):
@@ -12,6 +17,7 @@ def calculate_financial_ratios(conn, run_id):
     Trailing flows and opening/closing balances use the common CPI base in
     value_real. EPS is handled separately using period-specific disclosures.
     """
+    timer = StepTimer(logger, "Gold stage 3")
     conn.execute("""WITH facts AS (
         SELECT company_id, fiscal_year, fiscal_quarter,
             fiscal_year*4+fiscal_quarter AS period_number,
@@ -102,10 +108,13 @@ def calculate_financial_ratios(conn, run_id):
     ON CONFLICT (calculation_run_id,company_id,fiscal_year,fiscal_quarter,ratio_code)
     DO UPDATE SET value_quarter=EXCLUDED.value_quarter,value_ytd=EXCLUDED.value_ytd,
                   value_ttm=EXCLUDED.value_ttm,calculated_at=now()""", (run_id, run_id))
+    timer.mark("financial ratio SQL")
     calculate_eps_ratios(conn, run_id)
+    timer.mark("EPS values, coverage and EPS ratios")
     from bist.financials.services.price_earnings import calculate_price_earnings
 
     calculate_price_earnings(conn, run_id, financial_run_id=run_id)
+    timer.mark("price/earnings")
 
 
 def calculate_ratio_changes(conn, run_id):
