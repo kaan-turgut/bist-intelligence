@@ -164,6 +164,11 @@ def _adjust_price_stages(conn, run_id, year, month, symbol_ids):
         SELECT observation_date,
                EXP(SUM(LN(1 + value / 100.0)) OVER (ORDER BY observation_date)) AS price_index
         FROM silver.monthly_macro_data WHERE series_code='CPI_MONTHLY_RATE'
+    ), latest AS (
+        -- Prices newer than the latest CPI month use that month's level: no
+        -- inflation is assumed until their own month's CPI is published.
+        SELECT observation_date,price_index FROM cpi_index
+        ORDER BY observation_date DESC LIMIT 1
     ), target AS (
         SELECT make_date(%s,%s,1) AS base_date,
                (SELECT price_index FROM cpi_index
@@ -171,20 +176,25 @@ def _adjust_price_stages(conn, run_id, year, month, symbol_ids):
     )
     INSERT INTO gold.price_series
       (calculation_run_id,instrument_id,price_date,close_nominal,close_real,
-       inflation_base_year,inflation_base_month)
+       inflation_base_year,inflation_base_month,close_real_method)
     SELECT %s,p.instrument_id,p.price_date,p.close,
-           p.close*t.price_index/source.price_index,
+           p.close*t.price_index/COALESCE(source.price_index,carried.price_index),
            EXTRACT(YEAR FROM t.base_date)::integer,
-           EXTRACT(MONTH FROM t.base_date)::smallint
+           EXTRACT(MONTH FROM t.base_date)::smallint,
+           CASE WHEN source.price_index IS NOT NULL THEN 'cpi'
+                WHEN carried.price_index IS NOT NULL THEN 'latest_cpi_carried_forward' END
     FROM silver.daily_prices p CROSS JOIN target t
     LEFT JOIN cpi_index source
       ON source.observation_date=make_date(EXTRACT(YEAR FROM p.price_date)::integer,
                                            EXTRACT(MONTH FROM p.price_date)::integer,1)
+    LEFT JOIN latest carried
+      ON date_trunc('month',p.price_date)::date>carried.observation_date
     WHERE p.close IS NOT NULL""" + filter_sql + """
     ON CONFLICT (calculation_run_id,instrument_id,price_date) DO UPDATE
     SET close_nominal=EXCLUDED.close_nominal,close_real=EXCLUDED.close_real,
         inflation_base_year=EXCLUDED.inflation_base_year,
-        inflation_base_month=EXCLUDED.inflation_base_month,calculated_at=now()""",
+        inflation_base_month=EXCLUDED.inflation_base_month,
+        close_real_method=EXCLUDED.close_real_method,calculated_at=now()""",
     [year, month, year, month, run_id, *([symbol_ids] if symbol_ids is not None else [])])
     conn.execute("""DELETE FROM gold.price_series old
         USING gold.price_series current
@@ -203,6 +213,14 @@ def _adjust_price_stages(conn, run_id, year, month, symbol_ids):
                jsonb_build_object('price_level_year',%s,'price_level_month',%s)
         FROM gold.price_series WHERE calculation_run_id=%s AND close_real IS NULL""",
         (run_id, year, month, run_id))
+    conn.execute("""INSERT INTO ops.data_quality_results
+        (run_id,check_name,severity,affected_rows,details)
+        SELECT %s,'price_rows_after_latest_cpi','info',COUNT(*),
+               jsonb_build_object('method','latest_cpi_carried_forward',
+                                  'first_price_date',MIN(price_date),'last_price_date',MAX(price_date))
+        FROM gold.price_series
+        WHERE calculation_run_id=%s AND close_real_method='latest_cpi_carried_forward'""",
+        (run_id, run_id))
 
 
 def _adjust_prices_postgres(symbols=None):

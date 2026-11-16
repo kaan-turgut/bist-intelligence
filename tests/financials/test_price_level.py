@@ -221,6 +221,48 @@ def test_a_stray_month_blocks_publication_until_rebased(seeded, price_level):
     assert status["mismatches"]["price_series"] == 1
 
 
+@pytest.mark.parametrize(
+    "target, expected_real",
+    [
+        # Target is the latest CPI month: newer prices are used as they are.
+        ((2026, 12), Decimal(20)),
+        # Older target: the carried level is deflated like a December 2026 price.
+        ((2024, 3), Decimal(20) / MARCH_TO_DECEMBER),
+    ],
+)
+def test_prices_after_the_latest_cpi_month_carry_its_level_forward(
+    seeded, price_level, target, expected_real
+):
+    instrument = seeded.execute(
+        "SELECT instrument_id FROM metadata.instruments WHERE symbol='TEST'"
+    ).fetchone()["instrument_id"]
+    seeded.execute(
+        """INSERT INTO silver.daily_prices (instrument_id,price_date,close,source)
+           VALUES (%s,'2027-01-05',20,'IsYatirim')""",
+        (instrument,),
+    )
+    seeded.commit()
+    price_level(*target)
+    run = prices.adjust_prices_postgres()
+
+    rows = {
+        str(r["price_date"]): r
+        for r in seeded.execute(
+            "SELECT price_date,close_real,close_real_method FROM gold.current_price_series"
+        )
+    }
+    assert rows["2027-01-05"]["close_real_method"] == "latest_cpi_carried_forward"
+    assert rows["2027-01-05"]["close_real"] == pytest.approx(expected_real, rel=Decimal("1e-6"))
+    assert rows["2024-03-29"]["close_real_method"] == "cpi"
+    assert all(r["close_real"] is not None for r in rows.values())
+    check = seeded.execute(
+        """SELECT affected_rows,details FROM ops.data_quality_results
+           WHERE run_id=%s AND check_name='price_rows_after_latest_cpi'""",
+        (run,),
+    ).fetchone()
+    assert check["affected_rows"] == 1 and check["details"]["first_price_date"] == "2027-01-05"
+
+
 def test_a_waiting_run_reads_the_month_only_after_the_lock(seeded, price_level, legacy_database):
     price_level(2024, 3)
     with ThreadPoolExecutor(max_workers=1) as executor:
