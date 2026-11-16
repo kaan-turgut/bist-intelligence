@@ -222,7 +222,7 @@ def test_migration_preserves_financial_values_and_ratios(legacy_database):
         assert conn.execute("SELECT value_ttm FROM gold.current_financial_ratios").fetchone()["value_ttm"] == Decimal("0.4")
 
 
-def test_full_gold_pipeline_uses_ratio_only_ttm(database):
+def test_full_gold_pipeline_uses_ratio_only_ttm(database, price_level):
     conn, company, run = database
     for year, quarter in ((2023, 1), (2023, 2), (2023, 3), (2023, 4), (2024, 1)):
         for statement, item, amount in (("income_statement", "hasılat", 100),
@@ -251,7 +251,8 @@ def test_full_gold_pipeline_uses_ratio_only_ttm(database):
                 VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
                 (company, statement, year, quarter, filing, run))
     conn.commit()
-    new_run = pipeline.calculate_gold_financials_postgres(2024, 3, companies=[SimpleNamespace(symbol="TEST")])
+    price_level(2024, 3)
+    new_run = pipeline.calculate_gold_financials_postgres(companies=[SimpleNamespace(symbol="TEST")])
     ratio = conn.execute("""SELECT value_ttm FROM gold.current_financial_ratios
         WHERE fiscal_year=2024 AND fiscal_quarter=1 AND ratio_code='gross_margin'""").fetchone()
     assert ratio["value_ttm"] == Decimal("0.4")
@@ -265,14 +266,14 @@ def test_fresh_medallion_install_applies_both_migrations(legacy_database):
     assert pipeline.apply_medallion_migration()
     with legacy_database() as conn:
         versions = conn.execute("SELECT version FROM ops.schema_migrations ORDER BY version").fetchall()
-        assert [r["version"] for r in versions] == ["007", "008", "009", "010", "011", "012", "013", "014", "015", "016", "017"]
+        assert [r["version"] for r in versions] == ["007", "008", "009", "010", "011", "012", "013", "014", "015", "016", "017", "018"]
         columns = conn.execute("""SELECT column_name FROM information_schema.columns
             WHERE table_schema='gold' AND table_name='financial_values'""").fetchall()
         assert not any("ttm" in r["column_name"] for r in columns)
 
 
 @pytest.mark.parametrize("include_q3", [False, True])
-def test_cumulative_differences_require_immediate_previous_period(database, include_q3):
+def test_cumulative_differences_require_immediate_previous_period(database, include_q3, price_level):
     conn, company, run = database
     periods = [(1, 100), (2, 300), (4, 1000)]
     if include_q3:
@@ -296,7 +297,8 @@ def test_cumulative_differences_require_immediate_previous_period(database, incl
             (company_id,statement_type,fiscal_year,fiscal_quarter,filing_key,processing_run_id)
             VALUES (%s,'income_statement',2024,%s,%s,%s)""", (company, quarter, filing, run))
     conn.commit()
-    pipeline.calculate_gold_financials_postgres(2024, 12, companies=[SimpleNamespace(symbol="TEST")])
+    price_level(2024, 12)
+    pipeline.calculate_gold_financials_postgres(companies=[SimpleNamespace(symbol="TEST")])
     q4 = conn.execute("""SELECT value_quarter FROM gold.current_financial_values
         WHERE fiscal_year=2024 AND fiscal_quarter=4 AND item='hasılat'""").fetchone()
     assert q4["value_quarter"] == (400 if include_q3 else None)

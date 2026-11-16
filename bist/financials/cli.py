@@ -15,7 +15,6 @@ from bist.financials.services.earnings_per_share import (
 from bist.financials.services.postgres_financial_pipeline import (
     apply_medallion_migration,
     calculate_gold_financials_postgres,
-    resolve_postgres_inflation_period,
     update_database_postgres,
 )
 from bist.financials.services.postgres_price_pipeline import (
@@ -27,6 +26,12 @@ from bist.financials.services.postgres_reference_data import (
 )
 from bist.financials.services.postgres_setup import initialize_postgres
 from bist.financials.services.price_earnings import calculate_price_earnings_postgres
+from bist.financials.services.price_level import (
+    format_price_level,
+    parse_price_level,
+    price_level_status,
+    set_price_level,
+)
 from bist.financials.services.repair_cash_flows import repair_cash_flows_postgres
 from bist.financials.services.repair_financials import repair_financials_postgres
 from bist.logging_config import configure_logging
@@ -56,20 +61,18 @@ def add_company_arguments(parser):
     )
 
 
-def add_period_arguments(parser, *, include_price_level=False):
+def add_period_arguments(parser):
     parser.add_argument("--begin-year", type=int, required=True)
     parser.add_argument("--begin-quarter", type=int, choices=[1, 2, 3, 4], required=True)
     parser.add_argument("--end-year", type=int, required=True)
     parser.add_argument("--end-quarter", type=int, choices=[1, 2, 3, 4], required=True)
-    if include_price_level:
-        parser.add_argument(
-            "--price-level-year", type=int,
-            help="Inflation adjustment target year; defaults to the latest month in inflation_table.",
-        )
-        parser.add_argument(
-            "--price-level-month", type=int, choices=range(1, 13),
-            help="Inflation adjustment target month; defaults to the latest month in inflation_table.",
-        )
+
+
+def price_level_argument(value):
+    try:
+        return parse_price_level(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def build_parser():
@@ -81,7 +84,7 @@ def build_parser():
         help="Refresh sources, download statements, and publish PostgreSQL financial data."
     )
     add_company_arguments(run_parser)
-    add_period_arguments(run_parser, include_price_level=True)
+    add_period_arguments(run_parser)
     add_parsing_arguments(run_parser)
     run_parser.add_argument("--skip-download", action="store_true")
     run_parser.add_argument("--skip-reference-data", action="store_true")
@@ -108,7 +111,7 @@ def build_parser():
         help="Parse local archives and rebuild PostgreSQL financial values only."
     )
     add_company_arguments(database_parser)
-    add_period_arguments(database_parser, include_price_level=True)
+    add_period_arguments(database_parser)
     add_parsing_arguments(database_parser)
 
     gold_parser = commands.add_parser(
@@ -120,36 +123,29 @@ def build_parser():
         "calculate-pe", help="Calculate quarter-end P/E from published EPS and stored original prices only."
     )
     add_company_arguments(pe_parser)
-    gold_parser.add_argument(
-        "--price-level-year", type=int,
-        help="Inflation adjustment target year; defaults to the latest month in inflation_table.",
+
+    level_parser = commands.add_parser(
+        "set-price-level",
+        help="Change the project-wide CPI target month and recalculate every inflation-adjusted value.",
     )
-    gold_parser.add_argument(
-        "--price-level-month", type=int, choices=range(1, 13),
-        help="Inflation adjustment target month; defaults to the latest month in inflation_table.",
+    level_parser.add_argument(
+        "price_level", type=price_level_argument, metavar="YYYY-MM",
+        help="Target month with CPI data, for example 2026-10.",
+    )
+    commands.add_parser(
+        "show-price-level",
+        help="Show the project-wide CPI target month, the latest CPI month and published consistency.",
     )
 
     prices_parser = commands.add_parser(
         "update-prices", aliases=["update-prices-postgres"],
-        help="Download historical prices into PostgreSQL and optionally adjust for inflation."
+        help="Download historical prices into PostgreSQL and adjust them to the project price level."
     )
     add_company_arguments(prices_parser)
     prices_parser.add_argument("--begin-date", required=True, help="YYYY-MM-DD or DD-MM-YYYY")
     prices_parser.add_argument("--end-date", required=True, help="YYYY-MM-DD or DD-MM-YYYY")
     prices_parser.add_argument("--request-sleep", type=float, default=1.5)
     prices_parser.add_argument("--rate-limit-delay", type=float, default=120.0)
-    prices_parser.add_argument("--price-level-year", type=int)
-    prices_parser.add_argument("--price-level-month", type=int, choices=range(1, 13))
-
-    adjust_prices_parser = commands.add_parser(
-        "adjust-prices", aliases=["adjust-prices-postgres"],
-        help="Recalculate PostgreSQL inflation-adjusted prices without downloading."
-    )
-    add_company_arguments(adjust_prices_parser)
-    adjust_prices_parser.add_argument("--price-level-year", type=int, required=True)
-    adjust_prices_parser.add_argument(
-        "--price-level-month", type=int, choices=range(1, 13), required=True
-    )
 
     setup_parser = commands.add_parser(
         "init-postgres", help="Initialize the PostgreSQL schema and seed empty company metadata."
@@ -197,21 +193,40 @@ def download_statements(companies, begin_year, end_year, request_sleep, rate_lim
 
 
 def process_database_postgres(companies, args):
-    requested_price_level = None
-    if args.price_level_year is not None and args.price_level_month is not None:
-        requested_price_level = (args.price_level_year, args.price_level_month)
-    price_level = resolve_postgres_inflation_period(requested_price_level)
     logger.info(
-        "Updating database for %s companies, %s Q%s through %s Q%s; inflation price level %s-%02d",
+        "Updating database for %s companies, %s Q%s through %s Q%s",
         len(companies), args.begin_year, args.begin_quarter, args.end_year, args.end_quarter,
-        *price_level,
     )
     ingested, run_id = update_database_postgres(
         companies, args.begin_year, args.begin_quarter,
-        args.end_year, args.end_quarter, price_level=price_level,
+        args.end_year, args.end_quarter,
         parse_workers=args.parse_workers,
     )
     logger.info("PostgreSQL processed %s files; Gold calculation run %s", ingested, run_id)
+
+
+def print_price_level_status(status):
+    stored, latest = status["stored"], status["latest_cpi"]
+    print(f"Project price level: {format_price_level(stored)}")
+    print(f"Latest CPI month:    {format_price_level(latest)}")
+    published = ", ".join(format_price_level(level) for level in status["published"]) or "none"
+    print(f"Published months:    {published}")
+    if stored is None and len(status["published"]) > 1:
+        print("Published data is mixed. Run set-price-level YYYY-MM to recalculate it at one month.")
+    elif stored is None:
+        print("Not set yet: the next Gold or price run adopts the published month, or the latest CPI month.")
+    elif any(status["mismatches"].values()):
+        print(f"WARNING: rows not at the project price level: {status['mismatches']}")
+    else:
+        print("All published inflation-adjusted values use the project price level.")
+    if stored and latest and latest > stored:
+        print(f"Newer CPI is available. Rebase with: python -m bist.financials set-price-level "
+              f"{format_price_level(latest)}")
+    for row in status["history"]:
+        previous = (row["previous_year"], row["previous_month"]) if row["previous_year"] else None
+        print(f"  {row['changed_at']:%Y-%m-%d %H:%M} {format_price_level(previous)} -> "
+              f"{format_price_level((row['target_year'], row['target_month']))} "
+              f"(run {row['run_id']}, {row['details'].get('source')})")
 
 
 def main(argv=None):
@@ -224,11 +239,6 @@ def main(argv=None):
         end_period = args.end_year * 4 + args.end_quarter
         if begin_period > end_period:
             parser.error("the begin year/quarter must not be later than the end year/quarter")
-        if (args.price_level_year is None) != (args.price_level_month is None):
-            parser.error("provide both --price-level-year and --price-level-month, or neither")
-    elif args.command == "calculate-gold":
-        if (args.price_level_year is None) != (args.price_level_month is None):
-            parser.error("provide both --price-level-year and --price-level-month, or neither")
     elif args.command == "download" and args.begin_year > args.end_year:
         parser.error("--begin-year must not be later than --end-year")
 
@@ -237,6 +247,17 @@ def main(argv=None):
         return
     if args.command == "migrate-postgres":
         apply_medallion_migration()
+        return
+    if args.command == "set-price-level":
+        result = set_price_level(*args.price_level)
+        print(
+            f"Project price level: {format_price_level(result['price_level'])} "
+            f"(was {format_price_level(result['previous'])}). Recalculated "
+            f"{result['companies']} companies and all price series under run {result['run_id']}."
+        )
+        return
+    if args.command == "show-price-level":
+        print_price_level_status(price_level_status())
         return
     if args.command == "init-postgres":
         initialize_postgres(create_database=args.create_database)
@@ -282,17 +303,12 @@ def main(argv=None):
         process_database_postgres(resolve_companies(args.symbols), args)
     elif args.command == "calculate-gold":
         companies = resolve_companies(args.symbols) if args.symbols else None
-        requested_price_level = None
-        if args.price_level_year is not None:
-            requested_price_level = (args.price_level_year, args.price_level_month)
-        price_level = resolve_postgres_inflation_period(requested_price_level)
         logger.info(
-            "Calculating Gold from existing Silver data for %s; price level %s-%02d. "
+            "Calculating Gold from existing Silver data for %s at the project price level. "
             "No statements will be read or downloaded.",
             f"{len(companies)} companies" if companies else "all companies",
-            *price_level,
         )
-        run_id = calculate_gold_financials_postgres(*price_level, companies=companies)
+        run_id = calculate_gold_financials_postgres(companies=companies)
         logger.info("Gold calculation completed under run %s", run_id)
     elif args.command == "calculate-pe":
         companies = resolve_companies(args.symbols) if args.symbols else None
@@ -308,8 +324,6 @@ def main(argv=None):
             )
         process_database_postgres(companies, args)
     elif args.command in {"update-prices", "update-prices-postgres"}:
-        if (args.price_level_year is None) != (args.price_level_month is None):
-            parser.error("provide both --price-level-year and --price-level-month, or neither")
         companies = resolve_companies(args.symbols)
         symbols = (
             resolve_price_symbols(args.symbols)
@@ -321,11 +335,7 @@ def main(argv=None):
             symbols, args.begin_date, args.end_date,
             sleep_seconds=args.request_sleep, rate_limit_delay=args.rate_limit_delay,
         )
-        if args.price_level_year is not None:
-            adjust_prices_postgres(args.price_level_year, args.price_level_month, symbols)
-    elif args.command in {"adjust-prices", "adjust-prices-postgres"}:
-        symbols = resolve_price_symbols(args.symbols) if args.symbols else None
-        adjust_prices_postgres(args.price_level_year, args.price_level_month, symbols)
+        adjust_prices_postgres(symbols)
 
 
 if __name__ == "__main__":

@@ -127,10 +127,11 @@ def active_flows(conn):
         ORDER BY fiscal_quarter,item""").fetchall()
 
 
-def test_repair_restores_q2_q3_and_rebuilds_published_gold(database):
+def test_repair_restores_q2_q3_and_rebuilds_published_gold(database, price_level):
     conn, _, _ = database
     seed_sources(database)
-    pipeline.calculate_gold_financials_postgres(2024, 3, companies=[SimpleNamespace(symbol="TEST")])
+    price_level(2024, 3)
+    pipeline.calculate_gold_financials_postgres(companies=[SimpleNamespace(symbol="TEST")])
     result = repair_cash_flows_postgres()
     assert result["filings"] == 4
     assert result["companies"] == 1
@@ -151,12 +152,13 @@ def test_repair_restores_q2_q3_and_rebuilds_published_gold(database):
     assert active_flows(conn) == before
 
 
-def test_missing_prior_quarter_preserves_reported_ytd_without_inventing_quarter(database):
+def test_missing_prior_quarter_preserves_reported_ytd_without_inventing_quarter(database, price_level):
     conn, _, _ = database
     seed_sources(database, quarters=(1, 3, 4))
     result = repair_cash_flows_postgres()
     assert result["gold_runs"] == []  # Do not publish previously unpublished companies.
-    pipeline.calculate_gold_financials_postgres(2024, 3, companies=[SimpleNamespace(symbol="TEST")])
+    price_level(2024, 3)
+    pipeline.calculate_gold_financials_postgres(companies=[SimpleNamespace(symbol="TEST")])
     q3 = conn.execute("""SELECT value_quarter,value_ytd FROM gold.current_financial_values
         WHERE statement_type='cash_flow' AND fiscal_quarter=3 AND item=%s""", (OPERATING,)).fetchone()
     assert q3["value_quarter"] is None
@@ -257,11 +259,12 @@ def test_scoped_repair_leaves_other_companies_unchanged(database):
     assert [(r["symbol"], r["fiscal_quarter"]) for r in rows] == [("OTHER", 4), ("TEST", 2)]
 
 
-def test_gold_republication_prunes_superseded_rows_for_vanished_periods(database):
+def test_gold_republication_prunes_superseded_rows_for_vanished_periods(database, price_level):
     conn, _, _ = database
     seed_sources(database, quarters=(2,), old_q4_pointer=True)
     company = [SimpleNamespace(symbol="TEST")]
-    pipeline.calculate_gold_financials_postgres(2024, 3, companies=company)
+    price_level(2024, 3)
+    pipeline.calculate_gold_financials_postgres(companies=company)
     assert conn.execute("SELECT COUNT(*) AS n FROM gold.financial_values WHERE fiscal_quarter=4").fetchone()["n"]
     conn.commit()
     repair_cash_flows_postgres()  # Moves the filing to Q2 and republishes Gold.

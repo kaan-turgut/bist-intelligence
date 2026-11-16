@@ -236,7 +236,7 @@ def test_cleaner_retains_quarter_ytd_and_cross_year_current_period():
 
 
 def test_monthly_fx_matches_a_trading_date_after_the_first_and_noncalendar_end(
-    database,
+    database, price_level
 ):
     conn, company, run = database
     end = date(2024, 6, 30)
@@ -285,9 +285,8 @@ def test_monthly_fx_matches_a_trading_date_after_the_first_and_noncalendar_end(
         "UPDATE silver.monthly_macro_data SET value=100 WHERE observation_date='2024-06-01'"
     )
     conn.commit()
-    pipeline.calculate_gold_financials_postgres(
-        2024, 6, companies=[SimpleNamespace(symbol="TEST")]
-    )
+    price_level(2024, 6)
+    pipeline.calculate_gold_financials_postgres(companies=[SimpleNamespace(symbol="TEST")])
     result = conn.execute("SELECT * FROM gold.current_financial_values").fetchone()
     assert result["value_usd"] == 10
     assert (

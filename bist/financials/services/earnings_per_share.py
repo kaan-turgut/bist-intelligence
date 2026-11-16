@@ -728,7 +728,7 @@ def calculate_eps_changes(conn, run_id, company_ids=None):
 
 def _refresh_published(conn, company_ids):
     return conn.execute(
-        """SELECT DISTINCT c.symbol,g.inflation_base_year,g.inflation_base_month
+        """SELECT DISTINCT c.symbol
         FROM gold.current_financial_values g JOIN metadata.companies c USING (company_id)
         WHERE g.company_id=ANY(%s)""",
         (company_ids,),

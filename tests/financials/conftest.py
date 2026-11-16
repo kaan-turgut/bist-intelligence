@@ -61,3 +61,19 @@ def database(legacy_database):
             FROM generate_series('2022-01-01'::date,'2026-12-01'::date,interval '1 month') d""")
         conn.commit()
         yield conn, company_id, run_id
+
+
+@pytest.fixture
+def price_level(legacy_database):
+    """Store the project price level directly, as an initialized database holds it."""
+
+    def store(year, month):
+        with legacy_database() as conn:
+            conn.execute(
+                """INSERT INTO ops.price_level (singleton,target_year,target_month)
+                   VALUES (true,%s,%s) ON CONFLICT (singleton) DO UPDATE
+                   SET target_year=EXCLUDED.target_year,target_month=EXCLUDED.target_month""",
+                (year, month),
+            )
+
+    return store

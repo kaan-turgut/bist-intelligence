@@ -10,6 +10,7 @@ from decimal import Decimal
 from numbers import Real
 
 import pandas as pd
+from psycopg.types.json import Jsonb
 
 from bist.companies.metadata_store import connect_metadata_db
 from bist.financials.services.postgres_financial_pipeline import (
@@ -22,6 +23,12 @@ from bist.financials.services.price_fetcher import (
     fetch_symbol_prices,
     parse_price_date,
     prices_to_frame,
+)
+from bist.financials.services.price_level import (
+    check_price_level,
+    lock_price_level,
+    require_price_level,
+    warn_if_stale,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,84 +145,93 @@ def update_prices_postgres(symbols, begin_date, end_date, *, sleep_seconds=1.5, 
     return run_id
 
 
-def _adjust_prices_postgres(year, month, symbols=None):
-    year, month = int(year), int(month)
-    if not 1 <= month <= 12:
-        raise ValueError("Inflation target month must be between 1 and 12.")
+def _price_instrument_ids(conn, symbols):
+    if not symbols:
+        return None
+    normalized_symbols = [symbol.upper() for symbol in symbols]
+    rows = conn.execute("""SELECT instrument_id,symbol FROM metadata.instruments
+        WHERE symbol=ANY(%s)""", (normalized_symbols,)).fetchall()
+    missing = sorted(set(normalized_symbols) - {row["symbol"] for row in rows})
+    if missing:
+        raise ValueError("Unknown PostgreSQL instrument symbols: " + ", ".join(missing))
+    return [row["instrument_id"] for row in rows]
+
+
+def _adjust_price_stages(conn, run_id, year, month, symbol_ids):
+    """Publish real prices at ``year``-``month`` inside the caller's transaction."""
+    filter_sql = " AND p.instrument_id=ANY(%s)" if symbol_ids is not None else ""
+    conn.execute("""WITH cpi_index AS (
+        SELECT observation_date,
+               EXP(SUM(LN(1 + value / 100.0)) OVER (ORDER BY observation_date)) AS price_index
+        FROM silver.monthly_macro_data WHERE series_code='CPI_MONTHLY_RATE'
+    ), target AS (
+        SELECT make_date(%s,%s,1) AS base_date,
+               (SELECT price_index FROM cpi_index
+                WHERE observation_date=make_date(%s,%s,1)) AS price_index
+    )
+    INSERT INTO gold.price_series
+      (calculation_run_id,instrument_id,price_date,close_nominal,close_real,
+       inflation_base_year,inflation_base_month)
+    SELECT %s,p.instrument_id,p.price_date,p.close,
+           p.close*t.price_index/source.price_index,
+           EXTRACT(YEAR FROM t.base_date)::integer,
+           EXTRACT(MONTH FROM t.base_date)::smallint
+    FROM silver.daily_prices p CROSS JOIN target t
+    LEFT JOIN cpi_index source
+      ON source.observation_date=make_date(EXTRACT(YEAR FROM p.price_date)::integer,
+                                           EXTRACT(MONTH FROM p.price_date)::integer,1)
+    WHERE p.close IS NOT NULL""" + filter_sql + """
+    ON CONFLICT (calculation_run_id,instrument_id,price_date) DO UPDATE
+    SET close_nominal=EXCLUDED.close_nominal,close_real=EXCLUDED.close_real,
+        inflation_base_year=EXCLUDED.inflation_base_year,
+        inflation_base_month=EXCLUDED.inflation_base_month,calculated_at=now()""",
+    [year, month, year, month, run_id, *([symbol_ids] if symbol_ids is not None else [])])
+    conn.execute("""DELETE FROM gold.price_series old
+        USING gold.price_series current
+        WHERE current.calculation_run_id=%s
+          AND old.calculation_run_id<>%s
+          AND old.instrument_id=current.instrument_id
+          AND old.price_date=current.price_date""", (run_id, run_id))
+    conn.execute("""INSERT INTO ops.active_instrument_versions (dataset_name,instrument_id,run_id)
+        SELECT 'prices',instrument_id,%s FROM gold.price_series
+        WHERE calculation_run_id=%s GROUP BY instrument_id
+        ON CONFLICT (dataset_name,instrument_id) DO UPDATE
+        SET run_id=EXCLUDED.run_id,activated_at=now()""", (run_id, run_id))
+    conn.execute("""INSERT INTO ops.data_quality_results
+        (run_id,check_name,severity,affected_rows,details)
+        SELECT %s,'price_rows_missing_cpi','warning',COUNT(*),
+               jsonb_build_object('price_level_year',%s,'price_level_month',%s)
+        FROM gold.price_series WHERE calculation_run_id=%s AND close_real IS NULL""",
+        (run_id, year, month, run_id))
+
+
+def _adjust_prices_postgres(symbols=None):
     with connect_metadata_db() as conn:
-        target = conn.execute(
-            """SELECT 1 FROM silver.monthly_macro_data
-               WHERE series_code='CPI_MONTHLY_RATE' AND year=%s AND month=%s""",
-            (year, month),
-        ).fetchone()
-        if target is None:
-            raise ValueError(f"No CPI data for target month {year}-{month:02d}.")
-        symbol_ids = None
-        if symbols:
-            normalized_symbols = [symbol.upper() for symbol in symbols]
-            rows = conn.execute("""SELECT instrument_id,symbol FROM metadata.instruments
-                WHERE symbol=ANY(%s)""", (normalized_symbols,)).fetchall()
-            missing = sorted(set(normalized_symbols) - {row["symbol"] for row in rows})
-            if missing:
-                raise ValueError("Unknown PostgreSQL instrument symbols: " + ", ".join(missing))
-            symbol_ids = [row["instrument_id"] for row in rows]
-        run_id = _run_start(conn, "gold_price_adjustment", {
-            "price_level": [year, month], "symbols": symbols,
-        })
+        symbol_ids = _price_instrument_ids(conn, symbols)
+        run_id = _run_start(conn, "gold_price_adjustment", {"symbols": symbols})
         _PRICE_ADJUST_RUN_ID.set(run_id)
         conn.commit()
-        filter_sql = " AND p.instrument_id=ANY(%s)" if symbol_ids is not None else ""
-        conn.execute("""WITH cpi_index AS (
-            SELECT observation_date,
-                   EXP(SUM(LN(1 + value / 100.0)) OVER (ORDER BY observation_date)) AS price_index
-            FROM silver.monthly_macro_data WHERE series_code='CPI_MONTHLY_RATE'
-        ), target AS (
-            SELECT make_date(%s,%s,1) AS base_date,
-                   (SELECT price_index FROM cpi_index
-                    WHERE observation_date=make_date(%s,%s,1)) AS price_index
+        # Read the target only while holding the lock shared with Gold runs and
+        # rebases, so prices are always published at the project price level.
+        lock_price_level(conn)
+        year, month = require_price_level(conn, run_id)
+        warn_if_stale(conn, (year, month))
+        conn.execute(
+            "UPDATE ops.pipeline_runs SET parameters=parameters||%s WHERE run_id=%s",
+            (Jsonb({"price_level": [year, month]}), run_id),
         )
-        INSERT INTO gold.price_series
-          (calculation_run_id,instrument_id,price_date,close_nominal,close_real,
-           inflation_base_year,inflation_base_month)
-        SELECT %s,p.instrument_id,p.price_date,p.close,
-               p.close*t.price_index/source.price_index,
-               EXTRACT(YEAR FROM t.base_date)::integer,
-               EXTRACT(MONTH FROM t.base_date)::smallint
-        FROM silver.daily_prices p CROSS JOIN target t
-        LEFT JOIN cpi_index source
-          ON source.observation_date=make_date(EXTRACT(YEAR FROM p.price_date)::integer,
-                                               EXTRACT(MONTH FROM p.price_date)::integer,1)
-        WHERE p.close IS NOT NULL""" + filter_sql + """
-        ON CONFLICT (calculation_run_id,instrument_id,price_date) DO UPDATE
-        SET close_nominal=EXCLUDED.close_nominal,close_real=EXCLUDED.close_real,
-            inflation_base_year=EXCLUDED.inflation_base_year,
-            inflation_base_month=EXCLUDED.inflation_base_month,calculated_at=now()""",
-        [year, month, year, month, run_id, *([symbol_ids] if symbol_ids is not None else [])])
-        conn.execute("""DELETE FROM gold.price_series old
-            USING gold.price_series current
-            WHERE current.calculation_run_id=%s
-              AND old.calculation_run_id<>%s
-              AND old.instrument_id=current.instrument_id
-              AND old.price_date=current.price_date""", (run_id, run_id))
-        conn.execute("""INSERT INTO ops.active_instrument_versions (dataset_name,instrument_id,run_id)
-            SELECT 'prices',instrument_id,%s FROM gold.price_series
-            WHERE calculation_run_id=%s GROUP BY instrument_id
-            ON CONFLICT (dataset_name,instrument_id) DO UPDATE
-            SET run_id=EXCLUDED.run_id,activated_at=now()""", (run_id, run_id))
-        conn.execute("""INSERT INTO ops.data_quality_results
-            (run_id,check_name,severity,affected_rows,details)
-            SELECT %s,'price_rows_missing_cpi','warning',COUNT(*),
-                   jsonb_build_object('price_level_year',%s,'price_level_month',%s)
-            FROM gold.price_series WHERE calculation_run_id=%s AND close_real IS NULL""",
-            (run_id, year, month, run_id))
+        _adjust_price_stages(conn, run_id, year, month, symbol_ids)
+        check_price_level(conn, run_id, (year, month))
         _run_finish(conn, run_id)
     _PRICE_ADJUST_RUN_ID.set(None)
+    logger.info("Real prices published at price level %s-%02d under run %s", year, month, run_id)
     return run_id
 
 
-def adjust_prices_postgres(year, month, symbols=None):
+def adjust_prices_postgres(symbols=None):
+    """Recalculate real prices for ``symbols`` (all when None) at the project price level."""
     try:
-        return _adjust_prices_postgres(year, month, symbols)
+        return _adjust_prices_postgres(symbols)
     except KeyboardInterrupt:
         run_id = _PRICE_ADJUST_RUN_ID.get()
         if run_id is not None:

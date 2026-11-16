@@ -1,7 +1,6 @@
 """Restore cash-flow observations from retained Bronze filings, without downloads."""
 
 import logging
-from collections import defaultdict
 from types import SimpleNamespace
 
 import pandas as pd
@@ -55,7 +54,7 @@ def repair_cash_flows_postgres(companies=None):
         company_ids = sorted({row["company_id"] for row in versions})
         previous = conn.execute("""SELECT * FROM ops.active_filing_versions
             WHERE statement_type='cash_flow' AND company_id=ANY(%s)""", (company_ids,)).fetchall()
-        published = conn.execute("""SELECT DISTINCT c.symbol,g.inflation_base_year,g.inflation_base_month
+        published = conn.execute("""SELECT DISTINCT c.symbol
             FROM gold.current_financial_values g JOIN metadata.companies c USING (company_id)
             WHERE g.company_id=ANY(%s)""", (company_ids,)).fetchall()
         run_id = financials._run_start(conn, "cash_flow_repair", {
@@ -103,16 +102,13 @@ def repair_cash_flows_postgres(companies=None):
             conn.commit()
             raise
 
-    # Preserve each published company's existing inflation target and avoid
-    # publishing companies whose Gold calculations have not yet been requested.
-    targets = defaultdict(list)
-    for row in published:
-        targets[(row["inflation_base_year"], row["inflation_base_month"])].append(
-            SimpleNamespace(symbol=row["symbol"]))
+    # Republish only companies whose Gold data was already published; the Gold
+    # run uses the project price level, like every other publication.
+    published_companies = sorted({row["symbol"] for row in published})
     gold_runs = []
-    for (year, month), published_companies in targets.items():
+    if published_companies:
         gold_runs.append(financials.calculate_gold_financials_postgres(
-            year, month, companies=published_companies))
+            companies=[SimpleNamespace(symbol=symbol) for symbol in published_companies]))
     logger.info("Cash-flow repair run %s restored %s filings for %s companies; Gold runs %s",
                 run_id, len(versions), len(company_ids), gold_runs)
     return {"run_id": run_id, "filings": len(versions), "companies": len(company_ids), "gold_runs": gold_runs}

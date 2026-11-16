@@ -89,7 +89,7 @@ Kurulu bir şemayı güncellemek için `migrate-postgres` kullanın. Ardından y
 python -m bist.financials run --symbols THYAO TUPRS BIMAS --begin-year 2017 --begin-quarter 1 --end-year 2026 --end-quarter 2
 ```
 
-Komut referans verilerini yeniler, yıllık KAP arşivlerini `financial_statements/<SEMBOL>/<SEMBOL>_<YIL>.zip` altında saklar ve seçilen dönemleri yayımlar. TÜFE hedefi, veritabanındaki en güncel TÜFE ayıdır. Günlük fiyatları ayrıca `update-prices` ile alın ve F/K'yı `calculate-pe` ile yenileyin.
+Komut referans verilerini yeniler, yıllık KAP arşivlerini `financial_statements/<SEMBOL>/<SEMBOL>_<YIL>.zip` altında saklar ve seçilen dönemleri yayımlar. Enflasyon düzeltmesi, proje genelindeki fiyat seviyesini (TÜFE hedef ayını) kullanır; bkz. [Proje geneli fiyat seviyesi](#proje-geneli-fiyat-seviyesi). Günlük fiyatları ayrıca `update-prices` ile alın ve F/K'yı `calculate-pe` ile yenileyin.
 
 ## İşlemleri ayrı ayrı çalıştırma
 
@@ -108,22 +108,38 @@ python -m bist.financials update-database --symbols THYAO TUPRS BIMAS --begin-ye
 # Mevcut Silver kayıtlarından Gold finansal verilerini yeniden hesapla
 python -m bist.financials calculate-gold --symbols THYAO TUPRS BIMAS
 
-# Günlük hisse fiyatlarını indir
+# Günlük hisse fiyatlarını indir ve proje fiyat seviyesine göre düzelt
 python -m bist.financials update-prices --symbols THYAO TUPRS BIMAS --begin-date 2017-01-01 --end-date 2026-06-30
 
 # Saklanan fiyatlarla dönem sonu F/K'yı yenile
 python -m bist.financials calculate-pe --symbols THYAO TUPRS BIMAS
 
-# Fiyatları indirmeden enflasyon düzeltmesini yeniden hesapla
-python -m bist.financials adjust-prices --symbols THYAO TUPRS BIMAS --price-level-year 2026 --price-level-month 6
+# Proje fiyat seviyesini göster / değiştir ve her şeyi yeniden hesapla
+python -m bist.financials show-price-level
+python -m bist.financials set-price-level 2026-10
 
 # KAP'tan mevcut şirket metaverisini güncelle
 python -m bist.companies.update_company_info --symbols THYAO TUPRS BIMAS
 ```
 
-`run` ile mevcut arşivleri veya referans verilerini kullanmak için sırasıyla `--skip-download` ve `--skip-reference-data` seçenekleri vardır. `run`, `download`, `update-database` ve `update-prices` komutlarında `--symbols` verilmezse metaverideki tüm şirketler seçilir. `calculate-gold` etkin Silver kayıtlarını, `calculate-pe` yayımlanmış Gold EPS kayıtlarını, `adjust-prices` ise saklanan fiyatları kullanır. Komut seçeneklerini görmek için `python -m bist.financials <komut> --help` çalıştırın.
+`run` ile mevcut arşivleri veya referans verilerini kullanmak için sırasıyla `--skip-download` ve `--skip-reference-data` seçenekleri vardır. `run`, `download`, `update-database` ve `update-prices` komutlarında `--symbols` verilmezse metaverideki tüm şirketler seçilir. `calculate-gold` etkin Silver kayıtlarını, `calculate-pe` ise yayımlanmış Gold EPS kayıtlarını kullanır. Komut seçeneklerini görmek için `python -m bist.financials <komut> --help` çalıştırın.
 
-`run`, `update-database` ve `calculate-gold` için belirli bir TÜFE hedefi seçmek üzere `--price-level-year` ve `--price-level-month` seçeneklerini birlikte verin. Bu iki seçenek `update-prices` ile birlikte kullanıldığında Gold fiyat serisi de hesaplanır. `adjust-prices` her iki seçeneği de gerektirir.
+<a id="proje-geneli-fiyat-seviyesi"></a>
+
+### Proje geneli fiyat seviyesi
+
+Enflasyona göre düzeltilmiş tüm değerler (Gold finansal değerleri ve oranları, `eps_inflation_adj` ve reel fiyatlar) her zaman aynı TÜFE hedef ayındadır. Bu ay `ops.price_level` tablosunda tek bir kez saklanır. `run`, `update-database`, `calculate-gold`, `update-prices` ve onarım komutları hedef ayı kullanıcıdan almaz; saklanan ayı kullanır. Bu nedenle bazı şirketler Eylül, bazıları Ekim fiyatlarıyla yayımlanamaz.
+
+```bash
+python -m bist.financials show-price-level      # saklanan ay, en güncel TÜFE ayı ve tutarlılık
+python -m bist.financials set-price-level 2026-11
+```
+
+`set-price-level`, yayımlanmış tüm şirketlerin Gold verilerini (değerler, oranlar, EPS, `eps_inflation_adj` ve F/K) ve tüm fiyat serilerini yeni aya göre yeniden hesaplar. Saklanan ayı ancak bunların hepsi başarılı olduktan sonra, tek bir işlemde değiştirir. Herhangi bir adım başarısız olursa hiçbir şey değişmez ve önceki ay geçerli kalır. Değişiklikler `ops.price_level_history` içinde çalıştırma numaralarıyla kaydedilir. Ay için TÜFE verisi bulunmalıdır.
+
+- **Yeni TÜFE verisi hedefi kendiliğinden değiştirmez.** `update-reference-data` yeni bir ay eklediğinde komutlar bir uyarı yazar; yeni aya geçmek için `set-price-level` çalıştırın.
+- **İlk kurulum:** Ay henüz saklanmamışsa ilk Gold veya fiyat çalıştırması, yayımlanmış veriler tek bir ay kullanıyorsa o ayı, veritabanı boşsa en güncel TÜFE ayını benimser. Yayımlanmış veriler birden fazla ay içeriyorsa komutlar durur ve `set-price-level` ile tek aya geçmenizi ister.
+- **Koruma:** Gold, fiyat ve yeniden hesaplama çalıştırmaları ortak bir kilit kullanır ve hedef ayı yalnızca bu kilidi aldıktan sonra okur. Her çalıştırma sonunda `published_price_level_mismatch` kontrolü yayımlanmış tüm verileri saklanan ayla karşılaştırır; uyuşmazlık varsa çalıştırma geri alınır ve önceki yayın etkin kalır.
 
 ## Veri güvenliği ve kapsam
 
@@ -151,7 +167,7 @@ Altı ve dokuz aylık nakit akışları Silver katmanında gerçek mali çeyrekl
 python -m bist.financials repair-cash-flows
 ```
 
-`--symbols THYAO TUPRS BIMAS` ile kapsamı daraltabilirsiniz. Komut yalnızca nakit akışı Silver kayıtlarını yeniden yayımlar; özgün Bronze ve önceki Silver sürümlerini korur. Halihazırda Gold verisi yayımlanan şirketlerin hesaplamalarını mevcut enflasyon hedefleriyle yeniler. Gold verisi henüz yayımlanmamış şirketleri kendiliğinden yayımlamaz.
+`--symbols THYAO TUPRS BIMAS` ile kapsamı daraltabilirsiniz. Komut yalnızca nakit akışı Silver kayıtlarını yeniden yayımlar; özgün Bronze ve önceki Silver sürümlerini korur. Halihazırda Gold verisi yayımlanan şirketlerin hesaplamalarını proje fiyat seviyesiyle yeniler. Gold verisi henüz yayımlanmamış şirketleri kendiliğinden yayımlamaz.
 
 ## PostgreSQL finansal veri akışı
 
@@ -309,7 +325,7 @@ Download and process THYAO, TUPRS, and BIMAS from 2017 Q1 through 2026 Q2.
 python -m bist.financials run --symbols THYAO TUPRS BIMAS --begin-year 2017 --begin-quarter 1 --end-year 2026 --end-quarter 2
 ```
 
-The command refreshes reference data, stores annual KAP archives under `financial_statements/<SYMBOL>/<SYMBOL>_<YEAR>.zip`, and publishes the selected periods. The inflation target defaults to the latest stored CPI month. Fetch daily prices separately with `update-prices`, then refresh P/E with `calculate-pe`.
+The command refreshes reference data, stores annual KAP archives under `financial_statements/<SYMBOL>/<SYMBOL>_<YEAR>.zip`, and publishes the selected periods. Inflation adjustment uses the project-wide price level (CPI target month); see [Project price level](#project-price-level). Fetch daily prices separately with `update-prices`, then refresh P/E with `calculate-pe`.
 
 ## Run individual steps
 
@@ -328,22 +344,38 @@ python -m bist.financials update-database --symbols THYAO TUPRS BIMAS --begin-ye
 # Rebuild Gold financial data from existing Silver observations
 python -m bist.financials calculate-gold --symbols THYAO TUPRS BIMAS
 
-# Download daily prices
+# Download daily prices and adjust them to the project price level
 python -m bist.financials update-prices --symbols THYAO TUPRS BIMAS --begin-date 2017-01-01 --end-date 2026-06-30
 
 # Refresh fiscal quarter-end P/E using stored prices
 python -m bist.financials calculate-pe --symbols THYAO TUPRS BIMAS
 
-# Recalculate stored prices to a selected inflation level without downloading
-python -m bist.financials adjust-prices --symbols THYAO TUPRS BIMAS --price-level-year 2026 --price-level-month 6
+# Show or change the project price level, recalculating everything
+python -m bist.financials show-price-level
+python -m bist.financials set-price-level 2026-10
 
 # Refresh existing company metadata from KAP
 python -m bist.companies.update_company_info --symbols THYAO TUPRS BIMAS
 ```
 
-Use `--skip-download` or `--skip-reference-data` with `run` to reuse existing inputs. Omitting `--symbols` selects every company in PostgreSQL metadata for `run`, `download`, `update-database`, and `update-prices`. By default, `calculate-gold` uses all active Silver filings, `calculate-pe` uses all published Gold EPS records eligible for valuation, and `adjust-prices` uses all stored prices. Run `python -m bist.financials <command> --help` to see the available options.
+Use `--skip-download` or `--skip-reference-data` with `run` to reuse existing inputs. Omitting `--symbols` selects every company in PostgreSQL metadata for `run`, `download`, `update-database`, and `update-prices`. By default, `calculate-gold` uses all active Silver filings, and `calculate-pe` uses all published Gold EPS records eligible for valuation. Run `python -m bist.financials <command> --help` to see the available options.
 
-Set both `--price-level-year` and `--price-level-month` to choose an explicit CPI target for `run`, `update-database`, or `calculate-gold`. Passing both flags to `update-prices` also publishes the Gold price series. `adjust-prices` requires both flags.
+<a id="project-price-level"></a>
+
+### Project price level
+
+Every inflation-adjusted value (Gold financial values and ratios, `eps_inflation_adj`, and real prices) always uses the same CPI target month. That month is stored once, in `ops.price_level`. `run`, `update-database`, `calculate-gold`, `update-prices`, and the repair commands never take a target month from the user; they use the stored one. Some companies therefore cannot be published at September prices while others are at October prices.
+
+```bash
+python -m bist.financials show-price-level      # stored month, latest CPI month, and consistency
+python -m bist.financials set-price-level 2026-11
+```
+
+`set-price-level` recalculates the Gold data of every published company (values, ratios, EPS, `eps_inflation_adj`, and P/E) and every price series at the new month. Only after all of it succeeds does it switch the stored month, in one transaction. If any step fails, nothing changes and the previous month stays in force. Each change is logged with its run IDs in `ops.price_level_history`. The month must have CPI data.
+
+- **New CPI data does not move the target.** When `update-reference-data` adds a newer month, commands log a warning; run `set-price-level` to move to it.
+- **First use:** when no month is stored yet, the first Gold or price run adopts the month already used by the published data, or the latest CPI month in an empty database. If published data uses several months, commands stop and ask you to rebase with `set-price-level`.
+- **Safeguards:** Gold runs, price runs, and rebases share one lock and read the target month only after acquiring it. At the end of every run, the `published_price_level_mismatch` check compares all published data with the stored month; any mismatch rolls the run back and leaves the previous publication active.
 
 ## Data protection and behavior
 
@@ -372,7 +404,7 @@ To repair records that the older version incorrectly labeled Q4, rebuild cash-fl
 python -m bist.financials repair-cash-flows
 ```
 
-Add `--symbols THYAO TUPRS BIMAS` to limit the scope. The command republishes only cash-flow Silver observations and retains original Bronze filings and previous Silver versions. It recalculates already-published Gold companies using their existing inflation targets, without publishing companies whose Gold data was not previously active.
+Add `--symbols THYAO TUPRS BIMAS` to limit the scope. The command republishes only cash-flow Silver observations and retains original Bronze filings and previous Silver versions. It recalculates already-published Gold companies at the project price level, without publishing companies whose Gold data was not previously active.
 
 ## PostgreSQL financial pipeline
 

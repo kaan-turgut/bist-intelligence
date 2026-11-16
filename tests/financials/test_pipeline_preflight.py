@@ -23,7 +23,6 @@ def test_parse_workers_defaults_overrides_and_validation(command):
 def test_database_cli_forwards_parse_workers(monkeypatch):
     companies = [SimpleNamespace(symbol="TEST")]
     monkeypatch.setattr(pipeline, "resolve_companies", lambda symbols: companies)
-    monkeypatch.setattr(pipeline, "resolve_postgres_inflation_period", lambda target: (2026, 9))
     calls = []
 
     def update(*args, **kwargs):
@@ -33,7 +32,7 @@ def test_database_cli_forwards_parse_workers(monkeypatch):
     monkeypatch.setattr(pipeline, "update_database_postgres", update)
     main(["update-database", "--begin-year", "2023", "--begin-quarter", "1",
           "--end-year", "2023", "--end-quarter", "4", "--parse-workers", "4"])
-    assert calls == [((companies, 2023, 1, 2023, 4), {"price_level": (2026, 9), "parse_workers": 4})]
+    assert calls == [((companies, 2023, 1, 2023, 4), {"parse_workers": 4})]
 
 
 @pytest.mark.parametrize(

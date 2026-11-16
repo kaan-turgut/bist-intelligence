@@ -13,6 +13,7 @@ from multiprocessing import get_context
 from pathlib import Path
 
 import pandas as pd
+from psycopg.types.json import Jsonb
 
 from bist.companies.metadata_store import connect_metadata_db
 from bist.financials.parsing.obtain_paths import obtain_statement_paths
@@ -20,6 +21,12 @@ from bist.financials.parsing.parse_statement import parse_statement
 from bist.financials.services.financial_ratios import (
     calculate_financial_ratios,
     calculate_ratio_changes,
+)
+from bist.financials.services.price_level import (
+    check_price_level,
+    lock_price_level,
+    require_price_level,
+    warn_if_stale,
 )
 from bist.paths import FINANCIAL_STATEMENTS_DIR, MIGRATIONS_DIR
 
@@ -38,6 +45,7 @@ MIGRATIONS = (
     ("015", "015_price_earnings_estimates.sql"),
     ("016", "016_single_eps_ratio.sql"),
     ("017", "017_eps_inflation_adjustment.sql"),
+    ("018", "018_project_price_level.sql"),
 )
 TABLE_TYPES = {
     "Income Statement": "income_statement",
@@ -456,91 +464,32 @@ def ingest_statements_postgres(companies, begin_year, begin_quarter, end_year, e
     return len(parsed)
 
 
-def _calculate_gold_financials_postgres(price_level_year, price_level_month, *, companies=None):
-    """Build quarterly financial values and ratios with internal trailing inputs."""
+def _calculate_gold_financials_postgres(*, companies=None):
+    """Build quarterly financial values and ratios at the project price level."""
     with connect_metadata_db() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext('bist_finance_price_earnings'))")
+        lock_price_level(conn)
         calculation_started = time.perf_counter()
         run_id = _run_start(conn, "gold_financial_calculation", {
-            "price_level": [price_level_year, price_level_month],
             "symbols": [company.symbol for company in companies] if companies else None,
         })
         _GOLD_RUN_ID.set(run_id)
         conn.commit()
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext('bist_finance_price_earnings'))")
+        lock_price_level(conn)
+        # Read the target only while holding the lock, so a concurrent rebase
+        # cannot switch it between this read and publication.
+        price_level_year, price_level_month = require_price_level(conn, run_id)
+        warn_if_stale(conn, (price_level_year, price_level_month))
+        conn.execute(
+            "UPDATE ops.pipeline_runs SET parameters=parameters||%s WHERE run_id=%s",
+            (Jsonb({"price_level": [price_level_year, price_level_month]}), run_id),
+        )
         logger.info(
             "Gold calculation run %s started (price level %s-%02d)",
             run_id, price_level_year, price_level_month,
         )
-        from bist.financials.services.financial_values import (
-            calculate_financial_values,
-            calculate_value_changes,
-        )
-
-        stage_started = time.perf_counter()
-        logger.info("Gold stage 1/5: calculating values using source periods and measurement bases")
-        calculate_financial_values(conn, run_id, price_level_year, price_level_month, companies, CASH_BALANCE_ITEMS)
-        logger.info("Gold stage 1/5 complete in %.1f seconds", time.perf_counter() - stage_started)
-        conn.execute("ANALYZE gold.financial_values")
-        stage_started = time.perf_counter()
-        logger.info("Gold stage 2/5: calculating changes across exact adjacent periods")
-        calculate_value_changes(conn, run_id)
-        logger.info("Gold stage 2/5 complete in %.1f seconds", time.perf_counter() - stage_started)
-
-        stage_started = time.perf_counter()
-        logger.info("Gold stage 3/5: calculating financial ratios")
-        calculate_financial_ratios(conn, run_id)
-        logger.info("Gold stage 3/5 complete in %.1f seconds", time.perf_counter() - stage_started)
-
-        stage_started = time.perf_counter()
-        logger.info("Gold stage 4/5: calculating ratio changes")
-        calculate_ratio_changes(conn, run_id)
-        logger.info("Gold stage 4/5 complete in %.1f seconds", time.perf_counter() - stage_started)
-
-        stage_started = time.perf_counter()
-        logger.info("Gold stage 5/5: recording data-quality results and publishing active calculation run")
-        conn.execute("""INSERT INTO ops.data_quality_results
-            (run_id,check_name,severity,affected_rows,details)
-            SELECT %s,'financial_rows_missing_cpi','warning',COUNT(*),
-                   jsonb_build_object('price_level_year',%s,'price_level_month',%s)
-            FROM gold.financial_values WHERE calculation_run_id=%s AND value_quarter IS NOT NULL
-              AND measurement_basis<>'unknown' AND value_real IS NULL""",
-            (run_id, price_level_year, price_level_month, run_id))
-        for name, condition in (
-            ('financial_report_basis_unknown', "measurement_basis='unknown'"),
-            ('financial_quarter_unavailable', 'value_quarter IS NULL'),
-            ('financial_fx_unavailable', 'value_quarter IS NOT NULL AND value_usd IS NULL'),
-            # Seasonal businesses or IAS 29 restatement of earlier YTD figures can
-            # legitimately produce this; it flags rows for review, not rejection.
-            ('financial_negative_quarter_revenue',
-             "statement_type='income_statement' AND item='hasılat' AND value_quarter<0"),
-        ):
-            conn.execute('''INSERT INTO ops.data_quality_results(run_id,check_name,severity,affected_rows)
-                SELECT %s,%s,'warning',COUNT(*) FROM gold.financial_values
-                WHERE calculation_run_id=%s AND '''+condition, (run_id,name,run_id))
-        # Each run recalculates every active period of its companies, and the
-        # active pointer is per company. Prune all older rows for those companies,
-        # including periods that no longer exist (e.g. a cash flow once stored in
-        # an erroneous Q4 slot), so no unreachable Gold rows linger.
-        conn.execute("""DELETE FROM gold.financial_ratios old
-            WHERE old.calculation_run_id<>%s
-              AND old.company_id IN (
-                SELECT DISTINCT company_id FROM gold.financial_values
-                WHERE calculation_run_id=%s
-              )""", (run_id, run_id))
-        conn.execute("""DELETE FROM gold.financial_values old
-            WHERE old.calculation_run_id<>%s
-              AND old.company_id IN (
-                SELECT DISTINCT company_id FROM gold.financial_values
-                WHERE calculation_run_id=%s
-              )""", (run_id, run_id))
-        conn.execute("""INSERT INTO ops.active_company_versions (dataset_name,company_id,run_id)
-            SELECT 'financials',company_id,%s FROM gold.financial_values
-            WHERE calculation_run_id=%s GROUP BY company_id
-            ON CONFLICT (dataset_name,company_id) DO UPDATE
-            SET run_id=EXCLUDED.run_id,activated_at=now()""", (run_id, run_id))
+        _calculate_gold_stages(conn, run_id, price_level_year, price_level_month, companies)
+        check_price_level(conn, run_id, (price_level_year, price_level_month))
         _run_finish(conn, run_id)
-        logger.info("Gold stage 5/5 complete in %.1f seconds", time.perf_counter() - stage_started)
     _GOLD_RUN_ID.set(None)
     logger.info(
         "Gold calculation run %s completed in %.1f seconds",
@@ -549,12 +498,83 @@ def _calculate_gold_financials_postgres(price_level_year, price_level_month, *, 
     return run_id
 
 
-def calculate_gold_financials_postgres(price_level_year, price_level_month, *, companies=None):
+def _calculate_gold_stages(conn, run_id, price_level_year, price_level_month, companies):
+    """Calculate and publish one Gold run inside the caller's transaction."""
+    from bist.financials.services.financial_values import (
+        calculate_financial_values,
+        calculate_value_changes,
+    )
+
+    stage_started = time.perf_counter()
+    logger.info("Gold stage 1/5: calculating values using source periods and measurement bases")
+    calculate_financial_values(conn, run_id, price_level_year, price_level_month, companies, CASH_BALANCE_ITEMS)
+    logger.info("Gold stage 1/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+    conn.execute("ANALYZE gold.financial_values")
+    stage_started = time.perf_counter()
+    logger.info("Gold stage 2/5: calculating changes across exact adjacent periods")
+    calculate_value_changes(conn, run_id)
+    logger.info("Gold stage 2/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+
+    stage_started = time.perf_counter()
+    logger.info("Gold stage 3/5: calculating financial ratios")
+    calculate_financial_ratios(conn, run_id)
+    logger.info("Gold stage 3/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+
+    stage_started = time.perf_counter()
+    logger.info("Gold stage 4/5: calculating ratio changes")
+    calculate_ratio_changes(conn, run_id)
+    logger.info("Gold stage 4/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+
+    stage_started = time.perf_counter()
+    logger.info("Gold stage 5/5: recording data-quality results and publishing active calculation run")
+    conn.execute("""INSERT INTO ops.data_quality_results
+        (run_id,check_name,severity,affected_rows,details)
+        SELECT %s,'financial_rows_missing_cpi','warning',COUNT(*),
+               jsonb_build_object('price_level_year',%s,'price_level_month',%s)
+        FROM gold.financial_values WHERE calculation_run_id=%s AND value_quarter IS NOT NULL
+          AND measurement_basis<>'unknown' AND value_real IS NULL""",
+        (run_id, price_level_year, price_level_month, run_id))
+    for name, condition in (
+        ('financial_report_basis_unknown', "measurement_basis='unknown'"),
+        ('financial_quarter_unavailable', 'value_quarter IS NULL'),
+        ('financial_fx_unavailable', 'value_quarter IS NOT NULL AND value_usd IS NULL'),
+        # Seasonal businesses or IAS 29 restatement of earlier YTD figures can
+        # legitimately produce this; it flags rows for review, not rejection.
+        ('financial_negative_quarter_revenue',
+         "statement_type='income_statement' AND item='hasılat' AND value_quarter<0"),
+    ):
+        conn.execute('''INSERT INTO ops.data_quality_results(run_id,check_name,severity,affected_rows)
+            SELECT %s,%s,'warning',COUNT(*) FROM gold.financial_values
+            WHERE calculation_run_id=%s AND '''+condition, (run_id,name,run_id))
+    # Each run recalculates every active period of its companies, and the
+    # active pointer is per company. Prune all older rows for those companies,
+    # including periods that no longer exist (e.g. a cash flow once stored in
+    # an erroneous Q4 slot), so no unreachable Gold rows linger.
+    conn.execute("""DELETE FROM gold.financial_ratios old
+        WHERE old.calculation_run_id<>%s
+          AND old.company_id IN (
+            SELECT DISTINCT company_id FROM gold.financial_values
+            WHERE calculation_run_id=%s
+          )""", (run_id, run_id))
+    conn.execute("""DELETE FROM gold.financial_values old
+        WHERE old.calculation_run_id<>%s
+          AND old.company_id IN (
+            SELECT DISTINCT company_id FROM gold.financial_values
+            WHERE calculation_run_id=%s
+          )""", (run_id, run_id))
+    conn.execute("""INSERT INTO ops.active_company_versions (dataset_name,company_id,run_id)
+        SELECT 'financials',company_id,%s FROM gold.financial_values
+        WHERE calculation_run_id=%s GROUP BY company_id
+        ON CONFLICT (dataset_name,company_id) DO UPDATE
+        SET run_id=EXCLUDED.run_id,activated_at=now()""", (run_id, run_id))
+    logger.info("Gold stage 5/5 complete in %.1f seconds", time.perf_counter() - stage_started)
+
+
+def calculate_gold_financials_postgres(*, companies=None):
+    """Recalculate Gold for ``companies`` (all with Silver data when None)."""
     apply_medallion_migration()
     try:
-        return _calculate_gold_financials_postgres(
-            price_level_year, price_level_month, companies=companies
-        )
+        return _calculate_gold_financials_postgres(companies=companies)
     except KeyboardInterrupt:
         run_id = _GOLD_RUN_ID.get()
         if run_id is not None:
@@ -574,37 +594,22 @@ def calculate_gold_financials_postgres(price_level_year, price_level_month, *, c
         raise
 
 
-def resolve_postgres_inflation_period(requested=None):
-    if requested is not None:
-        year, month = map(int, requested)
-    else:
-        with connect_metadata_db() as conn:
-            row = conn.execute(
-                """SELECT year,month FROM silver.monthly_macro_data
-                   WHERE series_code='CPI_MONTHLY_RATE'
-                   ORDER BY observation_date DESC LIMIT 1"""
-            ).fetchone()
-        if row is None:
-            raise ValueError("No CPI data found in PostgreSQL. Run update-reference-data-postgres first.")
-        year, month = row["year"], row["month"]
-    if not 1 <= month <= 12:
-        raise ValueError("Inflation target month must be between 1 and 12.")
+def resolve_price_level():
+    """Fail early when no usable project price level exists; returns it."""
     with connect_metadata_db() as conn:
-        exists = conn.execute(
-            """SELECT 1 FROM silver.monthly_macro_data WHERE series_code='CPI_MONTHLY_RATE'
-               AND year=%s AND month=%s""", (year, month)
-        ).fetchone()
-    if not exists:
-        raise ValueError(f"No CPI data for target month {year}-{month:02d}.")
-    return year, month
+        lock_price_level(conn)
+        level = require_price_level(conn)
+        warn_if_stale(conn, level)
+    return level
 
 
 def update_database_postgres(companies, begin_year, begin_quarter, end_year, end_quarter,
-                              price_level=None, *, parse_workers=2):
+                              *, parse_workers=2):
     _validate_parse_workers(parse_workers)
     if (begin_year * 4 + begin_quarter) > (end_year * 4 + end_quarter):
         raise ValueError("The begin period must not be later than the end period.")
-    target = resolve_postgres_inflation_period(price_level)
+    level = resolve_price_level()
+    logger.info("Project price level for this update: %s-%02d", *level)
     logger.info("Starting local statement ingestion; no downloads will be attempted")
     parsed_count = ingest_statements_postgres(
         companies, begin_year, begin_quarter, end_year, end_quarter,
@@ -615,6 +620,6 @@ def update_database_postgres(companies, begin_year, begin_quarter, end_year, end
 
     update_eps_postgres(companies, rebuild_gold=False)
     logger.info("Starting Gold financial calculations")
-    run_id = calculate_gold_financials_postgres(*target, companies=companies)
+    run_id = calculate_gold_financials_postgres(companies=companies)
     logger.info("Gold financial calculations committed under run %s", run_id)
     return parsed_count, run_id

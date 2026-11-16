@@ -57,6 +57,10 @@ python -m bist.financials run --symbols THYAO --begin-year 2017 --begin-quarter 
 python -m bist.financials update-prices --symbols THYAO --begin-date 2017-01-01 --end-date 2026-06-30
 python -m bist.financials calculate-pe --symbols THYAO
 
+# Inflation adjustment: one project-wide CPI target month for every value
+python -m bist.financials show-price-level
+python -m bist.financials set-price-level 2026-10   # recalculates everything, then switches
+
 # Activity reports: index, download, ingest and extract
 python -m bist.activity_reports.fetcher index-and-download --symbols THYAO --begin-date 2017-01-01 --end-date "$(date +%F)"
 python -m bist.activity_reports.processor ingest --symbols THYAO
