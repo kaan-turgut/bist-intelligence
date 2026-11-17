@@ -1,5 +1,24 @@
 # BIST Intelligence
 
+![Value Radar: screens all BIST companies on operating margin, current ratio, leverage and real sales growth](docs/dashboard_screenshots/value_radar.png)
+
+<table>
+  <tr>
+    <td width="33%"><a href="docs/dashboard_screenshots/company_profile.png"><img src="docs/dashboard_screenshots/company_profile.png" alt="Company Profile: inflation-adjusted profit, margins, balance sheet and share price for one company"></a></td>
+    <td width="33%"><a href="docs/dashboard_screenshots/activity_reports_1.png"><img src="docs/dashboard_screenshots/activity_reports_1.png" alt="Activity Reports: net tone by period and topic, themes and event types extracted from activity reports"></a></td>
+    <td width="33%"><a href="docs/dashboard_screenshots/activity_reports_2.png"><img src="docs/dashboard_screenshots/activity_reports_2.png" alt="Activity Reports: strongest disclosures with source quotes and a per-company scorecard"></a></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Company Profile</b></td>
+    <td align="center"><b>Activity Reports</b></td>
+    <td align="center"><b>Disclosures and scorecard</b></td>
+  </tr>
+</table>
+
+**[Download the Power BI dashboard](https://github.com/kaan-turgut/bist-intelligence/releases/latest)**
+(`BIST Dashboard.pbix`, data included). Open it in Power BI Desktop to explore every page
+without setting up the database. Click a screenshot to see it at full size.
+
 Data pipelines for companies listed on Borsa İstanbul (BIST). Both pipelines read from KAP
 (Public Disclosure Platform) and write to one shared PostgreSQL database, `bist_finance`.
 

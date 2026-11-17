@@ -44,3 +44,6 @@ database_backups/
 *.log
 *.tmp
 *.part
+
+# Power BI dashboard (shared as a GitHub Release asset, too large for Git)
+*.pbix
